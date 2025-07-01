@@ -145,9 +145,12 @@ export class LLMCommunication {
         // Add to cache
         if (this.cacheMaxSize > 0 && this.cache.size >= this.cacheMaxSize) {
             // Evict oldest entry (Map preserves insertion order)
-            const oldestKey = this.cache.keys().next().value;
-            this.cache.delete(oldestKey);
-            console.log(`LLMCommunication: Cache full (max: ${this.cacheMaxSize}). Evicted oldest entry for key ${oldestKey.substring(0,10)}...`);
+            const oldestKeyIteratorResult = this.cache.keys().next();
+            if (!oldestKeyIteratorResult.done && typeof oldestKeyIteratorResult.value === 'string') {
+                const oldestKey = oldestKeyIteratorResult.value;
+                this.cache.delete(oldestKey);
+                console.log(`LLMCommunication: Cache full (max: ${this.cacheMaxSize}). Evicted oldest entry for key ${oldestKey.substring(0,10)}...`);
+            }
         }
         if (this.cacheMaxSize > 0) {
             this.cache.set(cacheKey, llmResponse);
