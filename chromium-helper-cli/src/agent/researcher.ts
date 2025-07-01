@@ -1,18 +1,37 @@
 // Contains the main LLM researcher logic
 import { LLMCommunication, LLMConfig, LLMProviderType } from './llm_communication.js';
 import { PersistentStorage } from './persistent_storage.js';
+
+// --- Workflow Management Types ---
+// Define types for workflows
+type WorkflowStepAction = (params: any) => Promise<string>; // Action can be any async function returning a string summary
+
+interface WorkflowStep {
+  name: string;
+  description: string;
+  action: WorkflowStepAction;
+  requiredParams?: string[]; // Parameters needed for this step's action
+}
+
+interface WorkflowDefinition {
+  id: string;
+  description: string;
+  steps: WorkflowStep[];
+  defaultParams?: Record<string, any>; // Default parameters for the workflow
+}
 import {
   SpecializedAgent,
   ProactiveBugFinder,
   BugPatternAnalysisAgent,
   CodebaseUnderstandingAgent,
   GenericTaskAgent,
-  GenericTaskAgentConfig,
-  SpecializedAgentType
+  SpecializedAgentType,
+  SharedAgentContextType, // Added SharedAgentContextType
+  KeyFileWithSymbols // Added KeyFileWithSymbols for typing 'f'
 } from './specialized_agents.js';
 import { ChromiumAPI } from '../api.js';
-import { loadConfig as loadChromiumHelperConfig, CHConfig } from '../config.js';
-import { AgentConfig, loadAgentConfig } from '../agent_config.js';
+import { loadConfig as loadChromiumHelperConfig, Config as CHConfig } from '../config.js'; // Changed CHConfig to Config
+import { AgentConfig, loadAgentConfig, GenericTaskAgentConfig } from '../agent_config.js'; // Added GenericTaskAgentConfig import
 
 
 export class LLMResearcher {
@@ -263,6 +282,168 @@ Be factual and concise.
     };
     this.registerWorkflow(targetedFileAuditWorkflow);
 
+    // --- Define "Deep Dive CL Analysis" Workflow ---
+    const deepDiveClAnalysisWorkflow: WorkflowDefinition = {
+      id: "deep-dive-cl-analysis",
+      description: "Performs an in-depth analysis of a Chromium CL: status, diffs, comments, related issues, trybots, and synthesizes a report.",
+      defaultParams: {
+        maxFilesToDiffReview: 3,
+        maxCommentsToConsider: 10,
+      },
+      steps: [
+        {
+          name: "Fetch CL Status & Basic Info",
+          description: "Fetches basic CL information including subject, status, owner, and commit message.",
+          action: async (params) => {
+            const clStatus = await this.chromiumApi.getGerritCLStatus(params.clNumber);
+            const commitMessage = clStatus.revisions?.[clStatus.current_revision]?.commit?.message || "Commit message not found.";
+            return JSON.stringify({
+              clSubject: clStatus.subject,
+              clStatus: clStatus.status,
+              clOwner: clStatus.owner?.email || "N/A",
+              clUpdated: clStatus.updated,
+              clLink: `https://chromium-review.googlesource.com/c/${params.clNumber}`,
+              commitMessage: commitMessage,
+              reportSection_BasicInfo: `CL Basic Info:\nSubject: ${clStatus.subject}\nStatus: ${clStatus.status}\nOwner: ${clStatus.owner?.email}\nUpdated: ${clStatus.updated}\nLink: ${clStatus.link}\nCommit Message (first 200 chars):\n${commitMessage.substring(0,200)}...\n`
+            });
+          }
+        },
+        {
+          name: "Fetch CL Comments & Identify Potential Issues",
+          description: "Fetches CL comments, summarizes them, and extracts mentioned issue IDs.",
+          requiredParams: ["clNumber", "commitMessage", "maxCommentsToConsider"],
+          action: async (params) => {
+            const commentsData = await this.chromiumApi.getGerritCLComments({ clNumber: params.clNumber });
+            let commentsSummary = `CL Comments (Top ${Math.min(commentsData.length, params.maxCommentsToConsider)} of ${commentsData.length}):\n`;
+            const relevantComments = commentsData.slice(0, params.maxCommentsToConsider);
+            relevantComments.forEach((comment: any) => {
+              commentsSummary += `  - ${comment.author?.name} (${comment.updated}): "${comment.message.substring(0, 100).replace(/\n/g, ' ')}..." (File: ${comment.file || 'N/A'})\n`;
+            });
+            if (commentsData.length === 0) commentsSummary = "No comments found.\n";
+
+            // Basic issue ID parsing (e.g., Bug: 12345, Fixed: chromium:12345)
+            const issueRegex = /(?:Bug|Fixed|Issue|Problem|Resolves|Addresses)[\s:=#]*(?:chromium[:\/])?(\d{6,})/gi;
+            let mentionedIssueIds: string[] = [];
+            let match;
+            const textToSearch = params.commitMessage + "\n" + relevantComments.map((c:any) => c.message).join("\n");
+            while ((match = issueRegex.exec(textToSearch)) !== null) {
+              if (!mentionedIssueIds.includes(match[1])) mentionedIssueIds.push(match[1]);
+            }
+            return JSON.stringify({
+              mentionedIssueIds,
+              reportSection_Comments: commentsSummary
+            });
+          }
+        },
+        {
+          name: "Fetch Details for Mentioned Issues",
+          description: "Fetches details for any issue IDs mentioned in the CL's commit message or comments.",
+          requiredParams: ["mentionedIssueIds"],
+          action: async (params) => {
+            let issuesDetails = "Related Issues:\n";
+            if (params.mentionedIssueIds && params.mentionedIssueIds.length > 0) {
+              for (const issueId of params.mentionedIssueIds.slice(0, 2)) { // Limit to 2 issues for brevity
+                try {
+                  const issue = await this.chromiumApi.getIssue(issueId);
+                  issuesDetails += `  - Issue ${issue.issueId}: ${issue.title} (Status: ${issue.status})\n    ${(issue.description || issue.comments?.[0]?.content || '').substring(0,100)}...\n`;
+                } catch (e) { issuesDetails += `  - Failed to fetch Issue ${issueId}: ${(e as Error).message}\n`; }
+              }
+            } else { issuesDetails += "  No specific issues mentioned or found.\n"; }
+            return JSON.stringify({ reportSection_RelatedIssues: issuesDetails });
+          }
+        },
+        {
+          name: "Fetch CL Diff & Select Files for Review",
+          description: "Fetches the CL's diff and selects a subset of files for detailed review.",
+          requiredParams: ["clNumber", "maxFilesToDiffReview"],
+          action: async (params) => {
+            const diffData = await this.chromiumApi.getGerritCLDiff({ clNumber: params.clNumber });
+            const changedFiles = Object.keys(diffData.filesData || {}).filter(f => f !== "/COMMIT_MSG");
+            // Simple selection: first N files (can be improved with heuristics)
+            const filesForReview = changedFiles.slice(0, params.maxFilesToDiffReview);
+            return JSON.stringify({
+              clDiffData: diffData.filesData, // Pass full diff data for next step
+              reportSection_ChangedFiles: `Changed Files Summary: ${changedFiles.length} files changed. Reviewing up to ${params.maxFilesToDiffReview} of them.\nSelected for review: ${filesForReview.join(', ') || 'None'}\n`
+            });
+          }
+        },
+        {
+          name: "LLM Security Review of Selected File Diffs",
+          description: "Performs an LLM-based security review of the diffs for selected files.",
+          requiredParams: ["clSubject", "clDiffData", "maxFilesToDiffReview", "sharedAgentContext"], // Assuming filesForReview was part of clDiffData or handled implicitly
+          action: async (params) => {
+            let diffReviewSummaries = "LLM Diff Review Highlights:\n";
+            const filesToReview = Object.keys(params.clDiffData || {}).filter(f => f !== "/COMMIT_MSG").slice(0, params.maxFilesToDiffReview);
+
+            if (filesToReview.length === 0) {
+              diffReviewSummaries += "  No files selected or available for diff review.\n";
+            } else {
+              for (const filePath of filesToReview) {
+                const fileDiff = params.clDiffData[filePath];
+                if (fileDiff?.content) {
+                  const addedOrModifiedLines = fileDiff.content
+                    .filter((line: any) => line.b && !line.a)
+                    .map((line: any) => line.b.substring(0,200)) // Limit line length
+                    .join('\n');
+
+                  if (addedOrModifiedLines.length > 0) {
+                    const llmPrompt = `Security review of diff for file "${filePath}" in CL "${params.clSubject}". Focus on common C++ pitfalls, IPC issues, web security. Diff (added/modified lines only, max 1000 chars):\n${addedOrModifiedLines.substring(0,1000)}\n\nKnown bug patterns to consider: ${params.sharedAgentContext.knownBugPatterns.slice(0,3).map((p:any)=>typeof p === 'string' ? p : p.name).join(', ')}. Be concise.`;
+                    const review = await this.llmComms.sendMessage(llmPrompt, "You are a Chromium security reviewer AI.");
+                    diffReviewSummaries += `  - ${filePath}: ${review.substring(0, 200)}...\n`;
+                  } else {
+                    diffReviewSummaries += `  - ${filePath}: No textual additions/modifications to review.\n`;
+                  }
+                }
+              }
+            }
+            return JSON.stringify({ reportSection_DiffReviews: diffReviewSummaries });
+          }
+        },
+        {
+          name: "Fetch Trybot Status",
+          description: "Fetches the trybot status for the CL.",
+          requiredParams: ["clNumber"],
+          action: async (params) => {
+            const botResults = await this.chromiumApi.getGerritCLTrybotStatus({ clNumber: params.clNumber });
+            let summary = `Trybot Status (Patchset ${botResults.patchset || 'latest'}):\n`;
+            summary += `  LUCI URL: ${botResults.luciUrl || 'N/A'}\n`;
+            summary += `  Stats: Total: ${botResults.totalBots}, Passed: ${botResults.passedBots}, Failed: ${botResults.failedBots}\n`;
+            if (botResults.failedBots > 0 && botResults.bots) {
+              summary += `  Failed bots: ${botResults.bots.filter((b:any) => b.status === 'FAILED').map((b:any)=>b.name).join(', ')}\n`;
+            }
+            return JSON.stringify({ reportSection_Trybots: summary });
+          }
+        },
+        {
+          name: "Synthesize Full Report",
+          description: "Synthesizes all gathered information into a final comprehensive report using an LLM.",
+          requiredParams: [
+            "clNumber", "clSubject", "reportSection_BasicInfo", "reportSection_Comments",
+            "reportSection_RelatedIssues", "reportSection_ChangedFiles",
+            "reportSection_DiffReviews", "reportSection_Trybots"
+          ],
+          action: async (params) => {
+            const synthesisPrompt = `
+Synthesize a comprehensive analysis report for Chromium CL: ${params.clNumber} ("${params.clSubject}")
+Based on the following sections:
+
+${params.reportSection_BasicInfo}
+${params.reportSection_Comments}
+${params.reportSection_RelatedIssues}
+${params.reportSection_ChangedFiles}
+${params.reportSection_DiffReviews}
+${params.reportSection_Trybots}
+
+Provide a final summary, overall assessment (e.g., potential risks, confidence in the CL), and any actionable insights or red flags. Be factual and concise.
+`;
+            const finalReport = await this.llmComms.sendMessage(synthesisPrompt, "You are an AI security analyst compiling a CL review report.");
+            return finalReport; // This is the final output of the workflow
+          }
+        }
+      ]
+    };
+    this.registerWorkflow(deepDiveClAnalysisWorkflow);
+
     // TODO: Define more workflows like "New API Security Check"
     console.log("Workflows initialized.");
   }
@@ -337,13 +518,23 @@ Be factual and concise.
 
     // Basic conversation history (can be improved)
     // const historyContext = conversationHistory.join("\n");
-    const systemPrompt = `You are a lead AI security researcher for Chromium. Your goal is to assist the user in finding vulnerabilities and understanding the codebase.
-You have access to specialized AI agents:
-- ProactiveBugFinder: Actively searches for bugs.
-- BugPatternAnalysis: Learns from past bugs to identify risky patterns.
-- CodebaseUnderstanding: Builds knowledge about how Chromium code works.
-Be concise and helpful. You can use tools by prefixing commands with '!' (e.g., !search query, !start-agent ProactiveBugFinding).
-The user is interacting with you via a CLI chatbot.`;
+    const systemPrompt = `You are a lead AI security researcher for Chromium. Your goal is to assist the user by finding vulnerabilities, understanding the codebase, and retrieving specific information using available tools.
+You have access to specialized AI agents (ProactiveBugFinder, BugPatternAnalysis, CodebaseUnderstanding) and a suite of information retrieval tools.
+Available tools (invoked by the system if you suggest them in the correct format):
+- !search <query> [options]: Searches Chromium code.
+- !file <filepath> [--start N --end M]: Retrieves file content.
+- !issue <id_or_url>: Fetches information about a specific issue.
+- !gerrit <cl_number_or_url> [status|diff|comments|file|bots] [options]: Retrieves CL details (Gerrit).
+
+If a user's query can be directly and fully addressed by one of these tools:
+1. First, try to formulate the exact command. Output it on a new line, prefixed with 'EXECUTE_COMMAND: '. For example:
+   User: "Show me the diff for CL 12345 for file src/foo.cc"
+   AI: I can fetch that for you.
+   EXECUTE_COMMAND: !gerrit 12345 diff --file src/foo.cc
+2. If you are unsure about parameters or prefer the user to invoke it, you can suggest the command. For example:
+   User: "How do I see comments for CL 123?"
+   AI: You can use the command \`!gerrit 123 comments\`.
+Always be concise and helpful. The user is interacting with you via a CLI chatbot.`;
 
     let enrichedQuery = query;
     let agentContributions = "";
@@ -364,27 +555,40 @@ The user is interacting with you via a CLI chatbot.`;
     // 2. Leverage CodebaseUnderstandingAgent's knowledge from shared context
     const fileUnderstandQueryMatch = query.match(/(?:understand|info on|context for) (?:file|path|module) ([\w\/.-]+)/i);
     if (fileUnderstandQueryMatch && fileUnderstandQueryMatch[1]) {
-      const filePathOrModule = fileUnderstandQueryMatch[1];
-      const insightsContext = this.sharedAgentContext.codebaseInsights; // No cast needed now
+        const filePathOrModule = fileUnderstandQueryMatch[1];
+        const insightsContext = this.sharedAgentContext.codebaseInsights;
+        let insightContribution = ""; // Changed variable name for clarity
 
-      let insight = insightsContext[filePathOrModule];
-      if (!insight) {
-        const parentKey = Object.keys(insightsContext).find(k => filePathOrModule.startsWith(k + '/'));
-        if (parentKey) insight = insightsContext[parentKey];
-      }
+        const cuaAgent = this.specializedAgents.get(SpecializedAgentType.CodebaseUnderstanding) as CodebaseUnderstandingAgent | undefined;
 
-      if (insight) {
-        let insightSummary = `\n[Context from CodebaseUnderstanding for ${insight.modulePath}]:\nSummary: ${insight.summary.substring(0, 300)}...\n`;
-        if (insight.keyFiles && insight.keyFiles.length > 0) {
-          insightSummary += `Key Files: ${insight.keyFiles.slice(0,2).map(f => f.filePath).join(', ')}...\n`;
+        // Heuristic: if path contains '.', assume it's a file and try on-demand analysis.
+        // Otherwise, assume it's a module path and look for pre-computed insights.
+        if (filePathOrModule.includes('.') && cuaAgent) {
+            console.log(`LLMResearcher: User query matches file understanding for: ${filePathOrModule}. Invoking CUA.provideContextForFile.`);
+            // This is an async call, so processQuery must handle it.
+            // Since processQuery is already async, we can await here.
+            const fileContext = await cuaAgent.provideContextForFile(filePathOrModule);
+            insightContribution = `\n[Context from CodebaseUnderstanding for ${filePathOrModule} (On-Demand)]:\n${fileContext}\n`;
+        } else if (insightsContext[filePathOrModule]) { // It's a module path with an existing insight
+            const insight = insightsContext[filePathOrModule];
+            let summary = `\n[Context from CodebaseUnderstanding for ${insight.modulePath}]:\nSummary: ${insight.summary.substring(0, 300)}...\n`;
+            if (insight.primaryOwners && insight.primaryOwners.length > 0) {
+                summary += `Primary Owners: ${insight.primaryOwners.join(', ')}\n`;
+            }
+            if (insight.keyFiles && insight.keyFiles.length > 0) {
+                summary += `Key Files: ${insight.keyFiles.slice(0,2).map((f: KeyFileWithSymbols) => f.filePath).join(', ')}...\n`;
+            }
+            if (insight.commonSecurityRisks && insight.commonSecurityRisks.length > 0) {
+                summary += `Common Risks: ${insight.commonSecurityRisks.slice(0,2).join(', ')}...\n`;
+            }
+            insightContribution = summary;
+        } else if (cuaAgent) { // Module path, no pre-computed insight, but CUA exists
+             console.log(`LLMResearcher: No pre-computed insight for module ${filePathOrModule}. CUA exists but not auto-triggering module analysis for this query.`);
+             insightContribution = `\n[CodebaseUnderstanding]: No pre-computed insight for module ${filePathOrModule}. Analysis can be triggered if needed (e.g., via a dedicated command or if CUA runs its cycle).\n`;
+        } else { // No CUA agent active or no specific file/module query
+            insightContribution = `\n[CodebaseUnderstanding]: No insight available for ${filePathOrModule} and CodebaseUnderstandingAgent is not active.\n`;
         }
-        if (insight.commonSecurityRisks && insight.commonSecurityRisks.length > 0) {
-          insightSummary += `Common Risks: ${insight.commonSecurityRisks.slice(0,2).join(', ')}...\n`;
-        }
-        agentContributions += insightSummary;
-      } else {
-        agentContributions += `\n[CodebaseUnderstanding]: No immediate detailed insight for ${filePathOrModule} in shared context. You can try tasking the agent to analyze it.\n`;
-      }
+        agentContributions += insightContribution;
     }
 
     // 3. Include recent findings if query is general (e.g., "any new findings?", "latest security alerts")
@@ -392,7 +596,7 @@ The user is interacting with you via a CLI chatbot.`;
         if (this.sharedAgentContext.findings && this.sharedAgentContext.findings.length > 0) {
             agentContributions += "\n[Recent Agent Findings]:\n";
             // Show last 2-3 findings
-            this.sharedAgentContext.findings.slice(-3).forEach(finding => {
+            this.sharedAgentContext.findings.slice(-3).forEach((finding: { sourceAgent: string, type: string, data: any, timestamp: Date }) => { // Typed 'finding'
                 agentContributions += `- ${finding.sourceAgent} (${finding.type}): ${JSON.stringify(finding.data).substring(0,150)}...\n`;
             });
         }
@@ -406,19 +610,38 @@ The user is interacting with you via a CLI chatbot.`;
     }
 
     try {
-      const llmResponse = await this.llmComms.sendMessage(enrichedQuery, systemPrompt);
+      let llmResponse = await this.llmComms.sendMessage(enrichedQuery, systemPrompt);
 
       await this.saveResearcherData({ lastQuery: query, lastResponseTimestamp: new Date().toISOString(), enrichedQueryProvided: !!agentContributions });
 
-      // TODO: Post-process LLM response, potentially trigger tools or other agents based on response.
-      // For example, if LLM suggests analyzing a file, it could auto-task ProactiveBugFinder.
+      const executeCommandPrefix = "EXECUTE_COMMAND: ";
+      const lines = llmResponse.split('\n');
+      let commandToExecute: string | null = null;
+      let conversationalPart = "";
 
-    // Log recent findings from shared context for debugging/visibility
-    if (this.sharedAgentContext.findings.length > 0) {
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].startsWith(executeCommandPrefix)) {
+          commandToExecute = lines[i].substring(executeCommandPrefix.length).trim();
+          // The rest of the lines after the command are ignored in this version.
+          // Conversational part includes lines before the command.
+          conversationalPart = lines.slice(0, i).join('\n').trim();
+          break;
+        }
+      }
+
+      if (commandToExecute) {
+        console.log(`LLM suggested command: ${commandToExecute}. Executing...`);
+        const toolOutput = await this.invokeTool(commandToExecute);
+        // Combine conversational part (if any) with tool output
+        return (conversationalPart ? conversationalPart + "\n" : "") + `Tool Output:\n${toolOutput}`;
+      }
+
+      // Log recent findings from shared context for debugging/visibility
+      if (this.sharedAgentContext.findings.length > 0) {
         // console.log(`LLMResearcher: Recent findings in shared context: ${JSON.stringify(this.sharedAgentContext.findings.slice(-3))}`);
-    }
+      }
 
-      return llmResponse;
+      return llmResponse; // Return original LLM response if no command was executed
     } catch (error) {
       console.error("Error processing query in LLMResearcher:", error);
       return "Sorry, I encountered an error trying to process your request.";
@@ -528,8 +751,8 @@ The user is interacting with you via a CLI chatbot.`;
             const issueResult = await this.chromiumApi.getIssue(mainArg);
             return `Issue ${issueResult.issueId}:\nTitle: ${issueResult.title}\nStatus: ${issueResult.status}\nURL: ${issueResult.browserUrl}\nDescription (partial):\n${(issueResult.description || issueResult.comments?.[0]?.content || 'N/A').substring(0,300)}...`;
 
-        case 'cl': // Example: !cl <cl_number_or_url> diff --file "path/to/file.cc"
-            if (!mainArg) return "Usage: !cl <cl_number_or_url> [status|diff|comments|file|bots] [options]";
+        case 'gerrit': // Changed 'cl' to 'gerrit'
+            if (!mainArg) return "Usage: !gerrit <cl_number_or_url> [status|diff|comments|file|bots] [options]";
             // Subcommand is now in remainingArgs[0] if present, options follow.
             const subCommand = remainingArgs.length > 0 ? remainingArgs.shift()! : 'status';
 
@@ -561,14 +784,99 @@ The user is interacting with you via a CLI chatbot.`;
                         patchset: subOptions.patchset ? parseInt(subOptions.patchset as string) : undefined
                     });
                     return `CL ${diff.clId} Diff (Patchset ${diff.patchset}):\nShowing ${diff.filePath ? 'file ' + diff.filePath : Object.keys(diff.filesData || {}).length + ' changed files'}\n${diff.diffData ? JSON.stringify(diff.diffData.content.slice(0,3), null, 2) + "\n..." : "No specific file diff requested or available." }`;
-                // Add more cl subcommands: comments, file, bots
+                case 'comments':
+                    // Define a simple type for comment structure based on usage
+                    type GerritComment = {
+                        author?: { name?: string };
+                        updated?: string;
+                        message: string;
+                        file?: string;
+                        patch_set?: number
+                    };
+                    const commentsResult = await this.chromiumApi.getGerritCLComments({ clNumber: mainArg });
+                    let commentsSummary = `CL ${mainArg} Comments (${commentsResult.length} total):\n`;
+                    commentsResult.slice(0, 5).forEach((comment: GerritComment) => {
+                        commentsSummary += `  - ${comment.author?.name || 'Unknown author'} (${comment.updated || 'N/A'}): "${comment.message.substring(0, 100).replace(/\n/g, ' ')}..." (File: ${comment.file || 'N/A'}, Patchset: ${comment.patch_set || 'N/A'})\n`;
+                    });
+                    if (commentsResult.length > 5) commentsSummary += `  ... and ${commentsResult.length - 5} more comments.\n`;
+                    if (commentsResult.length === 0) commentsSummary = `No comments found for CL ${mainArg}.`;
+                    return commentsSummary;
+                case 'file':
+                    // Usage: !gerrit <cl_id> file <file_path> [--patchset <ps_id>]
+                    const filePathArg = remainingArgs.length > 0 ? remainingArgs.shift()! : null;
+                    if (!filePathArg) return `Usage: !gerrit ${mainArg} file <file_path> [--patchset <ps_id>]`;
+
+                    // Re-parse options for the 'file' subcommand from the *new* remainingArgs
+                    const fileSubOptions: Record<string, string | boolean> = {};
+                    for (let i = 0; i < remainingArgs.length; i++) {
+                        const arg = remainingArgs[i];
+                        if (arg.startsWith('--')) {
+                            const optionName = arg.substring(2);
+                            if (i + 1 < remainingArgs.length && !remainingArgs[i+1].startsWith('-')) {
+                                fileSubOptions[optionName] = remainingArgs[i+1]; i++;
+                            } else { fileSubOptions[optionName] = true; }
+                        } else if (arg.startsWith('-')) {
+                            // Simple -p <val> parsing, extend if needed
+                            const optionChar = arg.substring(1);
+                             if (i + 1 < remainingArgs.length && !remainingArgs[i+1].startsWith('-')) {
+                                fileSubOptions[optionChar] = remainingArgs[i+1]; i++;
+                            } else { fileSubOptions[optionChar] = true; }
+                        }
+                    }
+
+                    const fileContentResult = await this.chromiumApi.getGerritPatchsetFile({
+                        clNumber: mainArg,
+                        filePath: filePathArg,
+                        patchset: fileSubOptions.patchset ? parseInt(fileSubOptions.patchset as string) : undefined
+                    });
+                    return `File: ${fileContentResult.filePath} (CL ${fileContentResult.clId}, Patchset ${fileContentResult.patchset})\n${fileContentResult.content}`;
+                case 'bots':
+                    // Usage: !cl <cl_id> bots [--patchset <ps_id>] [--failed-only]
+                    // Re-parse options for the 'bots' subcommand from remainingArgs
+                    const botSubOptions: Record<string, string | boolean> = {};
+                    for (let i = 0; i < remainingArgs.length; i++) {
+                        const arg = remainingArgs[i];
+                        if (arg.startsWith('--')) {
+                            const optionName = arg.substring(2);
+                            if (i + 1 < remainingArgs.length && !remainingArgs[i+1].startsWith('-')) {
+                                botSubOptions[optionName] = remainingArgs[i+1]; i++;
+                            } else { botSubOptions[optionName] = true; }
+                        } else if (arg.startsWith('-')) {
+                             const optionChar = arg.substring(1);
+                             if (i + 1 < remainingArgs.length && !remainingArgs[i+1].startsWith('-')) {
+                                botSubOptions[optionChar] = remainingArgs[i+1]; i++;
+                            } else { botSubOptions[optionChar] = true; }
+                        }
+                    }
+
+                    const botResults = await this.chromiumApi.getGerritCLTrybotStatus({
+                        clNumber: mainArg,
+                        patchset: botSubOptions.patchset ? parseInt(botSubOptions.patchset as string) : undefined,
+                        failedOnly: !!botSubOptions['failed-only']
+                    });
+
+                    let botsSummary = `CL ${botResults.clId} Trybot Status (Patchset ${botResults.patchset || 'latest'}, Run ID: ${botResults.runId || 'N/A'}):\n`;
+                    botsSummary += `LUCI URL: ${botResults.luciUrl || 'N/A'}\n`;
+                    botsSummary += `Total: ${botResults.totalBots}, Passed: ${botResults.passedBots}, Failed: ${botResults.failedBots}, Running: ${botResults.runningBots}, Canceled: ${botResults.canceledBots}\n`;
+                    if (botResults.bots && botResults.bots.length > 0) {
+                        botsSummary += "Bots:\n";
+                        botResults.bots.slice(0, 10).forEach((bot: any) => { // Show up to 10 bots
+                            botsSummary += `  - ${bot.name}: ${bot.status} (${bot.summary || 'No summary'})\n`;
+                        });
+                        if (botResults.bots.length > 10) {
+                            botsSummary += `  ... and ${botResults.bots.length - 10} more bots.\n`;
+                        }
+                    } else {
+                        botsSummary += botResults.message || "No specific bot details available.";
+                    }
+                    return botsSummary;
                 default:
-                    return `Unknown CL subcommand: ${subCommand}. Available: status, diff. Original args for cl: ${args.join(" ")}`;
+                    return `Unknown Gerrit subcommand: '${subCommand}'. Available: status, diff, comments, file, bots. Original args for gerrit: ${args.join(" ")}`;
             }
 
         // Add more tool mappings here for other ChromiumAPI methods
         default:
-          return `Unknown tool command: ${commandName}. Available tools: search, file, issue, cl.`;
+          return `Unknown tool command: '${commandName}'. Available tools: search, file, issue, gerrit.`;
       }
     } catch (error) {
         console.error(`Error invoking tool ${commandName}:`, error);
@@ -643,23 +951,6 @@ The user is interacting with you via a CLI chatbot.`;
   private runningGenericTasks: Map<string, GenericTaskAgent> = new Map();
 
   // --- Workflow Management ---
-  // Define types for workflows
-  type WorkflowStepAction = (params: any) => Promise<string>; // Action can be any async function returning a string summary
-
-  interface WorkflowStep {
-    name: string;
-    description: string;
-    action: WorkflowStepAction;
-    requiredParams?: string[]; // Parameters needed for this step's action
-  }
-
-  interface WorkflowDefinition {
-    id: string;
-    description: string;
-    steps: WorkflowStep[];
-    defaultParams?: Record<string, any>; // Default parameters for the workflow
-  }
-
   private definedWorkflows: Map<string, WorkflowDefinition> = new Map();
 
 

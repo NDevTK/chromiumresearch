@@ -2,6 +2,8 @@
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { LLMResearcher } from './researcher.js';
+import { SpecializedAgentType } from './specialized_agents.js'; // Added import
+import { GenericTaskAgentConfig } from '../agent_config.js'; // Added import
 
 export class Chatbot {
   private rl: readline.Interface;

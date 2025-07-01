@@ -35,6 +35,13 @@ export interface CodebaseUnderstandingConfig {
   maxProcessedModuleHistory?: number; // Max number of module paths to remember as analyzed
 }
 
+export interface GenericTaskAgentConfig {
+  id?: string; // Optional ID, can be auto-generated
+  taskDescription: string; // User-facing description of the task
+  llmPrompt: string; // The actual prompt to be sent to the LLM
+  // Potentially add context or other parameters LLM might need for the task
+}
+
 export interface AgentConfig {
   llm: AgentLLMConfig;
   proactiveBugFinder: ProactiveBugFinderConfig;
