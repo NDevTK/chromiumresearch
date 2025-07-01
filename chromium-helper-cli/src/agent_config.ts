@@ -21,18 +21,36 @@ export interface ProactiveBugFinderConfig {
     sensitivePathRecentCommitScore?: number;
   };
   maxProcessedFileHistory?: number; // Max number of file paths to remember
+  heuristicScanIntervalMinutes?: number; // Interval for heuristic scans (less relevant now)
+  idleCycleDelayMs?: number; // Delay when no work is found in continuous loop
+  itemProcessingCheckIntervalMs?: number; // How often to check if current item is done
+  interItemDelayMs?: number; // Small delay between processing items in the loop
+  maxCandidatesPerHeuristicQuery?: number; // Max candidates to fetch in one heuristic check
+  recheckIntervalMs?: number; // How long before a heuristically found file might be checked again
 }
 
 export interface BugPatternAnalysisConfig {
-  commitsPerCycle: number;
+  commitsPerCycle: number; // Commits per pattern extraction cycle
+  issuesPerCycle?: number; // Issues per issue analysis cycle (can default to commitsPerCycle)
   targetIssueSeverities?: string[]; // e.g., ["S0", "S1"]
   maxProcessedHistorySize?: number; // Max number of commit/issue IDs to remember
+  patternExtractionIntervalMinutes?: number; // Interval for commit-based pattern extraction (less relevant)
+  issueAnalysisIntervalMinutes?: number; // Interval for issue-based analysis (less relevant)
+  idleCycleDelayMsBPA?: number; // Delay when no work is found in continuous loop for BPA
+  itemProcessingCheckIntervalMsBPA?: number; // How often to check if current item is done for BPA
+  interItemDelayMsBPA?: number; // Small delay between processing items in BPA loop
 }
 
 export interface CodebaseUnderstandingConfig {
-  filesPerModuleCycle: number;
-  maxModuleInsights: number;
+  filesPerModuleCycle: number; // Files to analyze within a module during its detailed analysis
+  maxModuleInsights: number; // Max number of module insights to retain
   maxProcessedModuleHistory?: number; // Max number of module paths to remember as analyzed
+  moduleAnalysisIntervalMinutes?: number; // Interval for autonomous module analysis cycles (less relevant)
+  moduleInsightStalenessDays?: number; // How many days before an insight is considered stale for re-analysis
+  idleCycleDelayMsCUA?: number; // Delay when no work is found in continuous loop for CUA
+  itemProcessingCheckIntervalMsCUA?: number; // How often to check if current item is done for CUA
+  interItemDelayMsCUA?: number; // Small delay between processing items in CUA loop
+  exampleModulesForCUA?: string[]; // Example modules CUA might cycle through
 }
 
 export interface GenericTaskAgentConfig {
@@ -59,26 +77,52 @@ const DEFAULT_AGENT_CONFIG: AgentConfig = {
     defaultMaxTokens: 1500,
   },
   proactiveBugFinder: {
-    filesPerCycle: 3,
-    heuristicKeywords: ['mojo', 'IPC_MESSAGE_HANDLER', 'RuntimeEnabledFeatures'],
-    sensitivePathPatterns: ['third_party/blink/renderer/', 'content/browser/', 'services/network/'],
-    prioritizationScore: {
+    filesPerCycle: 1, // Now processes one main item at a time in its loop
+    heuristicKeywords: ['mojo', 'IPC_MESSAGE_HANDLER', 'RuntimeEnabledFeatures', 'unsafe_raw_ptr', 'reinterpret_cast'],
+    sensitivePathPatterns: ['third_party/blink/renderer/core/', 'content/browser/', 'services/network/', 'components/security_interstitials/', 'net/'],
+    prioritizationScore: { // This might be used for internal queue prioritization
       pathMatch: 5,
       keywordInFile: 3,
       recentClMention: 2,
       sensitivePathRecentCommitScore: 7,
     },
-    maxProcessedFileHistory: 100,
+    maxProcessedFileHistory: 200, // Increased history
+    heuristicScanIntervalMinutes: 5, // Kept for status, but loop is continuous
+    idleCycleDelayMs: 10000, // 10 seconds delay when idle
+    itemProcessingCheckIntervalMs: 1000, // 1 second check if busy
+    interItemDelayMs: 200, // 0.2 seconds between items
+    maxCandidatesPerHeuristicQuery: 5, // Fetch 5 potential candidates in one heuristic check
+    recheckIntervalMs: 7 * 24 * 3600 * 1000, // Re-check a file heuristically after 7 days
   },
   bugPatternAnalysis: {
-    commitsPerCycle: 2,
-    targetIssueSeverities: ["S0", "S1"], // Default to high severities
-    maxProcessedHistorySize: 200,
+    commitsPerCycle: 1, // Processes one commit at a time in its new loop
+    issuesPerCycle: 1,  // Processes one issue at a time
+    targetIssueSeverities: ["S0", "S1", "High"],
+    maxProcessedHistorySize: 250, // Slightly increased history
+    patternExtractionIntervalMinutes: 10, // Less relevant, kept for status
+    issueAnalysisIntervalMinutes: 10,     // Less relevant, kept for status
+    idleCycleDelayMsBPA: 20000, // 20 seconds delay when idle
+    itemProcessingCheckIntervalMsBPA: 1000, // 1 second check if busy
+    interItemDelayMsBPA: 300, // 0.3 seconds between items
   },
   codebaseUnderstanding: {
-    filesPerModuleCycle: 3,
-    maxModuleInsights: 20,
-    maxProcessedModuleHistory: 50,
+    filesPerModuleCycle: 3, // During a specific module's deep dive (still relevant for performSingleModuleAnalysis)
+    maxModuleInsights: 30, // Increased
+    maxProcessedModuleHistory: 75, // Increased
+    moduleAnalysisIntervalMinutes: 30, // Less relevant, kept for status
+    moduleInsightStalenessDays: 30, // Default: Stale after 30 days
+    idleCycleDelayMsCUA: 45000, // 45 seconds delay when idle
+    itemProcessingCheckIntervalMsCUA: 1000, // 1 second check if busy
+    interItemDelayMsCUA: 500, // 0.5 seconds between items
+    exampleModulesForCUA?: [ // Provide a default list
+        "components/safe_browsing/core/browser",
+        "services/network",
+        "content/browser/renderer_host",
+        "components/history",
+        "third_party/blink/renderer/core/editing",
+        "net/disk_cache",
+        "media/gpu"
+    ]
   }
 };
 

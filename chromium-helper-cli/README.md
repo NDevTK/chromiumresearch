@@ -584,6 +584,23 @@ Currently available example workflows:
 *   **`basic-cl-audit`**: Performs a quick audit of a Chromium CL (status, diff summary, brief LLM review).
 *   **`targeted-file-audit`**: Performs a more detailed security analysis of a specific file (context gathering, vulnerability scan, pattern matching, report synthesis).
 
+### Agent Operational Model
+
+The `ch agent` command launches an interactive CLI (powered by the `Chatbot` class) that interfaces with the `LLMResearcher`. The `LLMResearcher` coordinates a Large Language Model (LLM) and a suite of specialized agents.
+
+Starting with recent versions, these specialized agents (`ProactiveBugFinder`, `BugPatternAnalysisAgent`, `CodebaseUnderstandingAgent`) operate in a **continuous, autonomous mode** once started (e.g., via `!start-agent <AgentType>` in the agent CLI).
+
+*   **Continuous Operation**: Each specialized agent enters a main loop, continuously seeking and processing relevant information (files, commits, issues, modules) or tasks. They manage their own focus based on internal heuristics, learned patterns, and explicit requests.
+*   **Focus Management (Heuristic-Based)**:
+    *   `ProactiveBugFinder`: Continuously monitors sources like recent commits to sensitive areas and globally searches for risky code patterns identified by the LLM. It maintains an internal sense of priority for files to scan.
+    *   `BugPatternAnalysisAgent`: Alternates between scanning new commits and issues (prioritizing those linked to high-severity vulnerabilities) to extract and refine bug patterns.
+    *   `CodebaseUnderstandingAgent`: Works to build and maintain insights for various Chromium modules, prioritizing modules that are unanalyzed, stale, or deemed important by other heuristics.
+*   **Task Delegation via LLMResearcher**: When you interact with the `ch agent` CLI, the `LLMResearcher`, guided by its LLM, can delegate complex analysis tasks to the appropriate specialized agents. For example, if you ask "Find security issues in path/to/my/file.cc", the `LLMResearcher` may create a task for the `ProactiveBugFinder`. You'll be notified of this delegation and can track such requests using `!list-agent-requests`.
+*   **Inter-Agent Collaboration**: Agents share their findings (e.g., discovered vulnerabilities, new bug patterns, module insights) and can request tasks from each other through a shared context. This enables more sophisticated, collaborative analysis over time.
+*   **Persistent State**: Agents save their processed items history and learned data (like identified bug patterns or module insights), allowing them to improve over time and pick up where they left off between sessions, avoiding redundant work.
+
+This model allows the agent system to proactively and continuously learn about the codebase and identify potential issues in the background, while also being available to serve specific user requests delegated by the `LLMResearcher`.
+
 ---
 
 **Made with ❤️ for the Chromium developer community**
