@@ -95,6 +95,27 @@ export class Chatbot {
               response = "Usage: !task-result <taskId>";
             }
             break;
+          case 'workflow': // New command: !workflow <workflowId> [json_params]
+            if (args.length > 0) {
+              const workflowId = args.shift()!; // First arg is workflowId
+              let wfParams = {};
+              if (args.length > 0) {
+                try {
+                  // Remaining args joined and parsed as JSON
+                  wfParams = JSON.parse(args.join(' '));
+                } catch (e) {
+                  response = `Error parsing workflow parameters: ${(e as Error).message}. Parameters should be a valid JSON string. Usage: !workflow <workflowId> '{"key": "value"}'`;
+                  break;
+                }
+              }
+              response = await this.researcher.runWorkflow(workflowId, wfParams);
+            } else {
+              response = `Usage: !workflow <workflowId> [json_params_string]. Available workflows:\n${await this.researcher.getAvailableWorkflows()}`;
+            }
+            break;
+          case 'workflows': // New command: !workflows
+             response = await this.researcher.getAvailableWorkflows();
+             break;
           default:
             // Fallback to general tool invocation if not an agent management command
             // Also, specific agent status can be fetched via !agent-status <GenericTaskAgentID>

@@ -1,5 +1,6 @@
 // For interacting with LLMs (OpenAI, Ollama)
 import fetch, { Headers, RequestInit } from 'node-fetch';
+import crypto from 'node:crypto';
 
 export enum LLMProviderType {
   OpenAI = "OpenAI",
@@ -51,13 +52,20 @@ interface ChatCompletionResponse {
 export class LLMCommunication {
   private config: LLMConfig;
   private endpoint: string;
+  private cache: Map<string, string>; // Cache: hash -> response
+  private cacheMaxSize: number;
+  // TODO: Implement persistent cache (e.g., to a file) for LLM responses for CLI tool.
 
-  constructor(config: LLMConfig) {
+  constructor(config: LLMConfig, cacheSize: number = 100) {
     this.config = {
-        temperature: 0.7,
-        maxTokens: 1024,
+        // Defaults from LLMConfig can be part of its definition or applied here
+        temperature: config.temperature !== undefined ? config.temperature : 0.7,
+        maxTokens: config.maxTokens !== undefined ? config.maxTokens : 1024,
         ...config
     };
+    this.cache = new Map();
+    this.cacheMaxSize = cacheSize;
+    console.log(`LLMCommunication: Cache size set to ${this.cacheMaxSize}`);
 
     if (this.config.provider === LLMProviderType.Ollama) {
         if (!this.config.baseUrl) {
@@ -72,7 +80,25 @@ export class LLMCommunication {
     console.log(`LLMCommunication initialized for ${this.config.provider} (Model: ${this.config.model}) targeting endpoint: ${this.endpoint}`);
   }
 
+  private generateCacheKey(prompt: string, systemContext?: string): string {
+    const hash = crypto.createHash('sha256');
+    hash.update(prompt);
+    if (systemContext) {
+      hash.update(systemContext);
+    }
+    hash.update(this.config.model); // Model is part of the key
+    return hash.digest('hex');
+  }
+
   public async sendMessage(prompt: string, systemContext?: string): Promise<string> {
+    const cacheKey = this.generateCacheKey(prompt, systemContext);
+    if (this.cache.has(cacheKey)) {
+      console.log(`LLMCommunication: Cache hit for key ${cacheKey.substring(0,10)}...`);
+      return this.cache.get(cacheKey)!;
+    }
+    console.log(`LLMCommunication: Cache miss for key ${cacheKey.substring(0,10)}...`);
+
+
     const messages: ChatCompletionRequestMessage[] = [];
     if (systemContext) {
       messages.push({ role: "system", content: systemContext });
@@ -115,7 +141,19 @@ export class LLMCommunication {
       const completion = await response.json() as ChatCompletionResponse;
 
       if (completion.choices && completion.choices.length > 0 && completion.choices[0].message) {
-        return completion.choices[0].message.content.trim();
+        const llmResponse = completion.choices[0].message.content.trim();
+        // Add to cache
+        if (this.cacheMaxSize > 0 && this.cache.size >= this.cacheMaxSize) {
+            // Evict oldest entry (Map preserves insertion order)
+            const oldestKey = this.cache.keys().next().value;
+            this.cache.delete(oldestKey);
+            console.log(`LLMCommunication: Cache full (max: ${this.cacheMaxSize}). Evicted oldest entry for key ${oldestKey.substring(0,10)}...`);
+        }
+        if (this.cacheMaxSize > 0) {
+            this.cache.set(cacheKey, llmResponse);
+            console.log(`LLMCommunication: Stored response in cache for key ${cacheKey.substring(0,10)}...`);
+        }
+        return llmResponse;
       } else {
         console.error("LLM response format unexpected or empty:", completion);
         throw new Error("LLM response format unexpected or empty.");

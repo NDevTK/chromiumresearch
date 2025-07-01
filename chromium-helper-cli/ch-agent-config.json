@@ -1,0 +1,43 @@
+{
+  "llm": {
+    "ollamaModel": "llama3",
+    "ollamaBaseUrl": "http://localhost:11434",
+    "cacheMaxSize": 100,
+    "defaultTemperature": 0.7,
+    "defaultMaxTokens": 1500
+  },
+  "proactiveBugFinder": {
+    "filesPerCycle": 3,
+    "heuristicKeywords": [
+      "mojo",
+      "IPC_MESSAGE_HANDLER",
+      "RuntimeEnabledFeatures",
+      "unsafe_raw_ptr",
+      "reinterpret_cast"
+    ],
+    "sensitivePathPatterns": [
+      "third_party/blink/renderer/core/",
+      "content/browser/",
+      "services/network/",
+      "components/security_interstitials/",
+      "net/"
+    ],
+    "prioritizationScore": {
+      "pathMatch": 5,
+      "keywordInFile": 3,
+      "recentClMention": 2,
+      "sensitivePathRecentCommitScore": 7
+    },
+    "maxProcessedFileHistory": 100
+  },
+  "bugPatternAnalysis": {
+    "commitsPerCycle": 2,
+    "targetIssueSeverities": ["S0", "S1"],
+    "maxProcessedHistorySize": 200
+  },
+  "codebaseUnderstanding": {
+    "filesPerModuleCycle": 3,
+    "maxModuleInsights": 20,
+    "maxProcessedModuleHistory": 50
+  }
+}

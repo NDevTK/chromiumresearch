@@ -494,4 +494,96 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
+## 🤖 CH Agent System (Experimental)
+
+The `ch` CLI includes an experimental AI Agent system designed to assist with security analysis and codebase understanding for Chromium. This system is activated by running the `ch agent` command (or `npx chromium-helper agent`).
+
+### Agent Configuration (`ch-agent-config.json`)
+
+The agent system can be configured via a `ch-agent-config.json` file placed in the root directory where you run `chromium-helper-cli`. If this file is not found, default settings will be used.
+
+**Example `ch-agent-config.json`:**
+```json
+{
+  "llm": {
+    "ollamaModel": "llama3",
+    "ollamaBaseUrl": "http://localhost:11434",
+    "cacheMaxSize": 100,
+    "defaultTemperature": 0.7,
+    "defaultMaxTokens": 1500
+  },
+  "proactiveBugFinder": {
+    "filesPerCycle": 3,
+    "heuristicKeywords": [
+      "mojo",
+      "IPC_MESSAGE_HANDLER",
+      "RuntimeEnabledFeatures",
+      "unsafe_raw_ptr",
+      "reinterpret_cast"
+    ],
+    "sensitivePathPatterns": [
+      "third_party/blink/renderer/core/",
+      "content/browser/",
+      "services/network/",
+      "components/security_interstitials/",
+      "net/"
+    ],
+    "prioritizationScore": {
+      "pathMatch": 5,
+      "keywordInFile": 3,
+      "recentClMention": 2
+    }
+  },
+  "bugPatternAnalysis": {
+    "commitsPerCycle": 2
+  },
+  "codebaseUnderstanding": {
+    "filesPerModuleCycle": 3,
+    "maxModuleInsights": 20
+  }
+}
+```
+
+**Configuration Options:**
+
+*   **`llm`**: Settings for Large Language Model communication.
+    *   `ollamaModel`: (Default: "llama3") Specifies the Ollama model to use.
+    *   `ollamaBaseUrl`: (Default: "http://localhost:11434") Base URL for the Ollama API.
+    *   `cacheMaxSize`: (Default: 100) Maximum number of LLM responses to keep in the in-memory cache. Set to 0 to disable.
+    *   `defaultTemperature`: (Default: 0.7) Default sampling temperature for LLM.
+    *   `defaultMaxTokens`: (Default: 1500) Default maximum tokens for LLM responses.
+*   **`proactiveBugFinder`**: Settings for the Proactive Bug Finder agent.
+    *   `filesPerCycle`: (Default: 3) Number of files to analyze in each of its analysis cycles.
+    *   `heuristicKeywords`: List of keywords used to initially find potentially interesting files.
+    *   `sensitivePathPatterns`: List of file path patterns considered sensitive for prioritization.
+    *   `prioritizationScore`: Weights for different heuristics when selecting files for analysis.
+        *   `pathMatch`: Score for matching a sensitive path.
+        *   `keywordInFile`: Score for file path containing a heuristic keyword.
+        *   `recentClMention`: Score for file being mentioned in recent CL/issue activity.
+        *   `sensitivePathRecentCommitScore`: Score for file found in a recent commit to a sensitive path.
+    *   `maxProcessedFileHistory`: (Default: 100) Maximum number of file paths PBF remembers as processed to avoid re-analyzing in general sweeps.
+*   **`bugPatternAnalysis`**: Settings for the Bug Pattern Analysis agent.
+    *   `commitsPerCycle`: (Default: 2) Number of commits to analyze in each pattern extraction cycle.
+    *   `targetIssueSeverities`: (Default: `["S0", "S1"]`) Array of issue severities (e.g., "S0", "S1") to target when searching for issues. If empty or omitted, may use broader keyword search.
+    *   `maxProcessedHistorySize`: (Default: 200) Maximum number of commit IDs and issue IDs BPA remembers as processed.
+*   **`codebaseUnderstanding`**: Settings for the Codebase Understanding agent.
+    *   `filesPerModuleCycle`: (Default: 3) Number of files to analyze within a module during its analysis cycle.
+    *   `maxModuleInsights`: (Default: 20) Maximum number of module insights to retain in the shared context.
+    *   `maxProcessedModuleHistory`: (Default: 50) Maximum number of module paths CUA remembers as analyzed for its autonomous cycle.
+
+### Agent Workflows
+
+The agent system supports workflows that orchestrate multiple agents and LLM calls for complex tasks. You can list available workflows and run them:
+
+*   `!workflows`: Lists all registered workflows.
+*   `!workflow <workflow-id> [json-parameters]`: Runs a specific workflow.
+    *   Example: `!workflow basic-cl-audit {"clNumber": "1234567"}`
+    *   Example: `!workflow targeted-file-audit {"filePath": "path/to/your/file.cc"}`
+
+Currently available example workflows:
+*   **`basic-cl-audit`**: Performs a quick audit of a Chromium CL (status, diff summary, brief LLM review).
+*   **`targeted-file-audit`**: Performs a more detailed security analysis of a specific file (context gathering, vulnerability scan, pattern matching, report synthesis).
+
+---
+
 **Made with ❤️ for the Chromium developer community**
