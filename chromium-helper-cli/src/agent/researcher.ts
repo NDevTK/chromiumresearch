@@ -525,16 +525,29 @@ Available tools (invoked by the system if you suggest them in the correct format
 - !file <filepath> [--start N --end M]: Retrieves file content.
 - !issue <id_or_url>: Fetches information about a specific issue.
 - !gerrit <cl_number_or_url> [status|diff|comments|file|bots] [options]: Retrieves CL details (Gerrit).
+- !agent-status <agent_type_or_id>: Checks the status of a specialized agent or generic task.
+- !list-agent-requests: Lists active or recent inter-agent requests.
 
-If a user's query can be directly and fully addressed by one of these tools:
-1. First, try to formulate the exact command. Output it on a new line, prefixed with 'EXECUTE_COMMAND: '. For example:
-   User: "Show me the diff for CL 12345 for file src/foo.cc"
-   AI: I can fetch that for you.
-   EXECUTE_COMMAND: !gerrit 12345 diff --file src/foo.cc
-2. If you are unsure about parameters or prefer the user to invoke it, you can suggest the command. For example:
-   User: "How do I see comments for CL 123?"
-   AI: You can use the command \`!gerrit 123 comments\`.
-Always be concise and helpful. The user is interacting with you via a CLI chatbot.`;
+Interactions:
+1. DIRECT COMMAND: If the query directly maps to a tool (e.g., "search for X"), prefix the command with 'EXECUTE_COMMAND: '.
+   Example: User: "search for Browser::Create" -> AI: EXECUTE_COMMAND: !search Browser::Create
+2. SUGGEST COMMAND: If unsure, suggest the command to the user.
+   Example: User: "how to see CL 123 comments?" -> AI: You can use \`!gerrit 123 comments\`.
+3. DELEGATE TASK: If the query is a complex task suitable for a specialized agent (ProactiveBugFinder, BugPatternAnalysis, CodebaseUnderstanding), formulate a delegation request. Output it on a new line, prefixed with 'DELEGATE_TASK: '. The JSON should include "targetAgentType", "taskType", and "params".
+   Available specialized agents and their common taskTypes:
+     - ProactiveBugFinder:
+       - taskType: "analyze_file_for_vulnerabilities", params: {"filePath": "path/to/file.cc"}
+     - BugPatternAnalysisAgent:
+       - taskType: "get_contextual_advice_for_snippet", params: {"codeSnippet": "code..."}
+     - CodebaseUnderstandingAgent:
+       - taskType: "get_module_insight", params: {"modulePath": "components/foo"}
+       - taskType: "provide_context_for_file", params: {"filePath": "path/to/file.cc"}
+   Example: User: "analyze components/foo/bar.cc for bugs"
+   AI: I will ask the ProactiveBugFinder agent to analyze that file.
+   DELEGATE_TASK: {"targetAgentType": "ProactiveBugFinding", "taskType": "analyze_file_for_vulnerabilities", "params": {"filePath": "components/foo/bar.cc"}, "userQuery": "analyze components/foo/bar.cc for bugs"}
+4. GENERAL QUERY: For other questions, provide a helpful textual response, possibly incorporating information from the shared agent context.
+
+Always be concise. The user is interacting with you via a CLI chatbot.`;
 
     let enrichedQuery = query;
     let agentContributions = "";
@@ -615,16 +628,34 @@ Always be concise and helpful. The user is interacting with you via a CLI chatbo
       await this.saveResearcherData({ lastQuery: query, lastResponseTimestamp: new Date().toISOString(), enrichedQueryProvided: !!agentContributions });
 
       const executeCommandPrefix = "EXECUTE_COMMAND: ";
+      const delegateTaskPrefix = "DELEGATE_TASK: ";
       const lines = llmResponse.split('\n');
       let commandToExecute: string | null = null;
+      let taskToDelegate: any = null; // Will hold the parsed JSON for the task
       let conversationalPart = "";
+      let responseToSendToUser = "";
 
       for (let i = 0; i < lines.length; i++) {
         if (lines[i].startsWith(executeCommandPrefix)) {
           commandToExecute = lines[i].substring(executeCommandPrefix.length).trim();
-          // The rest of the lines after the command are ignored in this version.
-          // Conversational part includes lines before the command.
           conversationalPart = lines.slice(0, i).join('\n').trim();
+          // Any lines after EXECUTE_COMMAND are ignored by the execution logic.
+          break;
+        } else if (lines[i].startsWith(delegateTaskPrefix)) {
+          try {
+            const taskJsonString = lines[i].substring(delegateTaskPrefix.length).trim();
+            taskToDelegate = JSON.parse(taskJsonString);
+            conversationalPart = lines.slice(0, i).join('\n').trim();
+            // Any lines after DELEGATE_TASK are considered part of the conversational response.
+            if (lines.length > i + 1) {
+                conversationalPart += "\n" + lines.slice(i + 1).join("\n");
+            }
+          } catch (e) {
+            console.error("LLMResearcher: Failed to parse DELEGATE_TASK JSON:", e, lines[i]);
+            // Fallback to treating the whole LLM response as conversational if parsing fails
+            taskToDelegate = null; // Ensure it's null so it doesn't proceed with bad data
+            conversationalPart = llmResponse; // Use the full original response
+          }
           break;
         }
       }
@@ -632,16 +663,43 @@ Always be concise and helpful. The user is interacting with you via a CLI chatbo
       if (commandToExecute) {
         console.log(`LLM suggested command: ${commandToExecute}. Executing...`);
         const toolOutput = await this.invokeTool(commandToExecute);
-        // Combine conversational part (if any) with tool output
-        return (conversationalPart ? conversationalPart + "\n" : "") + `Tool Output:\n${toolOutput}`;
+        responseToSendToUser = (conversationalPart ? conversationalPart + "\n" : "") + `Tool Output:\n${toolOutput}`;
+      } else if (taskToDelegate && taskToDelegate.targetAgentType && taskToDelegate.taskType && taskToDelegate.params) {
+        const requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+        const newRequest: AgentRequest = {
+          requestId,
+          targetAgentType: taskToDelegate.targetAgentType as SpecializedAgentType,
+          taskType: taskToDelegate.taskType,
+          params: taskToDelegate.params,
+          requestingAgentId: "ChatbotLLM", // Or LLMResearcher
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          priority: taskToDelegate.priority || 50, // Default priority
+        };
+        this.sharedAgentContext.requests.push(newRequest);
+        console.log(`LLMResearcher: Delegated task ${requestId} to ${newRequest.targetAgentType} for task ${newRequest.taskType}.`);
+
+        // Construct user message
+        // The conversationalPart might already be the AI's explanation (e.g., "I will ask the PBF agent...")
+        // If not, generate a default one.
+        if (conversationalPart.trim()) {
+            responseToSendToUser = conversationalPart + `\n(Task ID: ${requestId} created for ${newRequest.targetAgentType})`;
+        } else {
+            responseToSendToUser = `I've tasked the ${newRequest.targetAgentType} agent with: ${newRequest.taskType} (Params: ${JSON.stringify(newRequest.params).substring(0,50)}...). Task ID: ${requestId}. You can check status with !list-agent-requests.`;
+        }
+
+      } else {
+        // No command, no delegation, just a general LLM response
+        responseToSendToUser = llmResponse;
       }
 
-      // Log recent findings from shared context for debugging/visibility
-      if (this.sharedAgentContext.findings.length > 0) {
-        // console.log(`LLMResearcher: Recent findings in shared context: ${JSON.stringify(this.sharedAgentContext.findings.slice(-3))}`);
-      }
+      // Log recent findings from shared context for debugging/visibility (optional)
+      // if (this.sharedAgentContext.findings.length > 0) {
+      //   console.log(`LLMResearcher: Recent findings: ${JSON.stringify(this.sharedAgentContext.findings.slice(-3))}`);
+      // }
 
-      return llmResponse; // Return original LLM response if no command was executed
+      return responseToSendToUser;
     } catch (error) {
       console.error("Error processing query in LLMResearcher:", error);
       return "Sorry, I encountered an error trying to process your request.";
@@ -1039,17 +1097,27 @@ Always be concise and helpful. The user is interacting with you via a CLI chatbo
       }
 
       try {
-        const stepResult = await step.action(mergedParams);
+        const stepResult = await step.action(mergedParams); // This is expected to be a string, potentially JSON.
         fullReport += `Description: ${step.description}\nResult:\n${stepResult}\n\n`;
-        // Check if stepResult (potentially JSON string) contains data to merge into params for subsequent steps
+
+        // Attempt to parse stepResult as JSON and merge if it's an object.
+        // This allows steps to output structured data that subsequent steps can easily use.
         try {
-            const stepOutputData = JSON.parse(stepResult);
-            if (typeof stepOutputData === 'object' && stepOutputData !== null) {
-                // console.log(`Merging output from step ${step.name} into workflow params:`, stepOutputData);
-                Object.assign(mergedParams, stepOutputData); // Merge results for next steps
-            }
+          const parsedResult = JSON.parse(stepResult);
+          if (typeof parsedResult === 'object' && parsedResult !== null && !Array.isArray(parsedResult)) {
+            console.log(`Workflow '${workflow.id}', Step '${step.name}': Output was valid JSON object. Merging into workflow parameters.`);
+            Object.assign(mergedParams, parsedResult);
+          } else {
+            // console.log(`Workflow '${workflow.id}', Step '${step.name}': Output was JSON but not an object, or was an array. Storing as string under step name.`);
+            // If it's valid JSON but not an object (e.g. a string, number, array), store it under a key like "stepName_output"
+            // For simplicity, we'll only merge objects directly. Other JSON types could be stored if needed:
+            // mergedParams[`${step.name}_output`] = parsedResult;
+          }
         } catch (e) {
-            // Not JSON, or not an object, so don't attempt to merge.
+          // Output was not valid JSON, so it remains a simple string result.
+          // console.log(`Workflow '${workflow.id}', Step '${step.name}': Output was not JSON. Handled as plain string.`);
+          // Optionally, store the plain string result under a specific key if needed by subsequent steps,
+          // but the primary mechanism is merging JSON objects.
         }
 
       } catch (error) {
@@ -1077,5 +1145,38 @@ Always be concise and helpful. The user is interacting with you via a CLI chatbo
       // });
     });
     return info;
+  }
+
+  public listAgentRequests(): string {
+    if (!this.sharedAgentContext || !this.sharedAgentContext.requests || this.sharedAgentContext.requests.length === 0) {
+      return "No agent requests found in the shared context.";
+    }
+    let report = "Current Agent Requests:\n";
+    // Sort by priority (lower first) then by creation date
+    const sortedRequests = [...this.sharedAgentContext.requests].sort((a, b) => {
+        const priorityDiff = (a.priority ?? 100) - (b.priority ?? 100);
+        if (priorityDiff !== 0) return priorityDiff;
+        return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+    });
+
+    for (const req of sortedRequests) {
+      report += `------------------------------------\n`;
+      report += `ID: ${req.requestId}\n`;
+      report += `Target: ${req.targetAgentType}\n`;
+      report += `Task: ${req.taskType}\n`;
+      report += `Status: ${req.status}\n`;
+      report += `Created: ${new Date(req.createdAt).toLocaleString()}\n`;
+      report += `Updated: ${new Date(req.updatedAt).toLocaleString()}\n`;
+      if (req.requestingAgentId) report += `Requester: ${req.requestingAgentId}\n`;
+      if (req.priority) report += `Priority: ${req.priority}\n`;
+      report += `Params: ${JSON.stringify(req.params).substring(0, 100)}${JSON.stringify(req.params).length > 100 ? '...' : ''}\n`;
+      if (req.status === "completed" && req.result) {
+        report += `Result: ${JSON.stringify(req.result).substring(0, 150)}${JSON.stringify(req.result).length > 150 ? '...' : ''}\n`;
+      } else if (req.status === "failed" && req.error) {
+        report += `Error: ${req.error}\n`;
+      }
+    }
+    report += `------------------------------------\nTotal requests: ${this.sharedAgentContext.requests.length}\n`;
+    return report;
   }
 }
