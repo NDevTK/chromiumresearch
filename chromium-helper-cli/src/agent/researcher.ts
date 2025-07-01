@@ -11,45 +11,62 @@ import {
   SpecializedAgentType
 } from './specialized_agents.js';
 import { ChromiumAPI } from '../api.js';
-import { loadConfig as loadChromiumHelperConfig } from '../config.js';
+import { loadConfig as loadChromiumHelperConfig, CHConfig } from '../config.js';
+import { AgentConfig, loadAgentConfig } from '../agent_config.js';
 
 
 export class LLMResearcher {
+  private agentConfig!: AgentConfig; // To be loaded async
   private llmComms: LLMCommunication;
   private storage: PersistentStorage;
   private specializedAgents: Map<SpecializedAgentType, SpecializedAgent>;
   private chromiumApi!: ChromiumAPI; // Definite assignment assertion, will be set in async constructor/init
+  private sharedAgentContext: SharedAgentContextType; // Use the specific type here
 
   // Private constructor to force initialization via static async method
-  private constructor() {
+  private constructor(agentConfig: AgentConfig) { // Accept agentConfig here
+    this.agentConfig = agentConfig; // Store it
     // Initialize LLM communication and storage synchronously
-    const llmConfig: LLMConfig = {
-      provider: LLMProviderType.Ollama,
-      baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
-      model: process.env.OLLAMA_MODEL || "llama3", // Environment variable or default
-      // apiKey: process.env.OPENAI_API_KEY, // Only if using OpenAI
+    // LLMConfig now comes from agentConfig
+    const llmApiConfig: LLMConfig = {
+      provider: LLMProviderType.Ollama, // TODO: Make provider configurable if supporting OpenAI too
+      baseUrl: this.agentConfig.llm.ollamaBaseUrl,
+      model: this.agentConfig.llm.ollamaModel,
+      temperature: this.agentConfig.llm.defaultTemperature,
+      maxTokens: this.agentConfig.llm.defaultMaxTokens,
+      // apiKey: process.env.OPENAI_API_KEY, // Only if using OpenAI & configured
     };
-    this.llmComms = new LLMCommunication(llmConfig);
+    this.llmComms = new LLMCommunication(llmApiConfig, this.agentConfig.llm.cacheMaxSize); // Pass cache size
     this.storage = new PersistentStorage('LLMResearcher_main');
     this.specializedAgents = new Map();
+    // Initialize with the correct type
+    this.sharedAgentContext = {
+      findings: [],
+      requests: [],
+      knownBugPatterns: [],
+      codebaseInsights: {},
+    };
     // Note: chromiumApi is not initialized here yet.
   }
 
   public static async create(): Promise<LLMResearcher> {
-    const researcher = new LLMResearcher();
+    const agentConfig = await loadAgentConfig(); // Load config first
+    const researcher = new LLMResearcher(agentConfig); // Pass it to constructor
     await researcher.initializeAsyncComponents();
     return researcher;
   }
 
   private async initializeAsyncComponents(): Promise<void> {
+    // Note: agentConfig is already loaded and available via this.agentConfig
     try {
-      const chHelperConfig = await loadChromiumHelperConfig();
+      const chHelperConfig = await loadChromiumHelperConfig(); // Main CLI config for API keys etc.
       this.chromiumApi = new ChromiumAPI(chHelperConfig.apiKey);
-      this.chromiumApi.setDebugMode(process.env.CH_AGENT_DEBUG === 'true'); // Allow debug for underlying API
+      this.chromiumApi.setDebugMode(process.env.CH_AGENT_DEBUG === 'true');
       console.log("ChromiumAPI initialized for LLMResearcher.");
 
       // Now that chromiumApi is initialized, we can create specialized agents that depend on it.
       this.initializeSpecializedAgents();
+      this.initializeWorkflows(); // Initialize/register workflows
       await this.loadResearcherData(); // Load persistent data
       console.log("LLM Researcher fully initialized.");
 
@@ -61,22 +78,231 @@ export class LLMResearcher {
     }
   }
 
+  private initializeWorkflows(): void {
+    // --- Define "Basic CL Audit" Workflow ---
+    const basicClAuditWorkflow: WorkflowDefinition = {
+      id: "basic-cl-audit",
+      description: "Performs a basic audit of a Chromium CL: fetches CL info, changed files, and asks LLM for a quick security review of the diffs.",
+      steps: [
+        {
+          name: "Fetch CL Status",
+          description: "Fetches basic information and status for the given CL.",
+          requiredParams: ["clNumber"],
+          action: async (params) => {
+            const clStatus = await this.chromiumApi.getGerritCLStatus(params.clNumber);
+            // Return as JSON string; this allows the workflow runner to merge these outputs
+            // into the 'mergedParams' object for subsequent steps if the output is a valid JSON object.
+            return JSON.stringify({
+              clSubject: clStatus.subject,
+              clStatus: clStatus.status,
+              clOwner: clStatus.owner.email,
+              clUpdated: clStatus.updated,
+              clLink: `https://chromium-review.googlesource.com/c/${params.clNumber}`
+            });
+          }
+        },
+        {
+          name: "Fetch CL Diff",
+          description: "Fetches the diff for the CL.",
+          requiredParams: ["clNumber"],
+          action: async (params) => {
+            const diffData = await this.chromiumApi.getGerritCLDiff({ clNumber: params.clNumber });
+            // For simplicity, just summarize file changes. A real workflow might iterate per file.
+            const changedFiles = Object.keys(diffData.filesData || {}).join(', ');
+            // Store the full diff data in mergedParams for the next step.
+            // The return string is a summary for the report.
+            return JSON.stringify({ changedFilesSummary: `Files changed: ${changedFiles}`, clDiffData: diffData.filesData });
+          }
+        },
+        {
+            name: "LLM Security Review of Diff",
+            description: "Asks the LLM to perform a brief security review of the code changes.",
+            requiredParams: ["clSubject", "clDiffData"],
+            action: async (params) => {
+                let diffSummaryForLlm = `Review CL: "${params.clSubject}".\n`;
+                let fileCount = 0;
+                for (const filePath in params.clDiffData) {
+                    if (fileCount < 3) { // Limit to 3 files for this basic review to keep it short
+                        const fileDiff = params.clDiffData[filePath];
+                        if (fileDiff.content) {
+                             // Only take 'b' (added/modified lines) for brevity, and limit length
+                            const addedOrModifiedLines = fileDiff.content
+                                .filter((line: any) => line.b && !line.a) // lines added or where only 'b' exists (new content)
+                                .map((line: any) => line.b)
+                                .join('\n');
+                            if (addedOrModifiedLines.length > 0) {
+                                diffSummaryForLlm += `--- File: ${filePath} ---\n${addedOrModifiedLines.substring(0, 1000)}\n...\n`;
+                                fileCount++;
+                            }
+                        }
+                    } else {
+                        diffSummaryForLlm += `... and more files.\n`;
+                        break;
+                    }
+                }
+                if (!fileCount) return "No textual diff content found to review.";
+
+                let knownPatternsContext = "";
+                if (this.sharedAgentContext.knownBugPatterns && this.sharedAgentContext.knownBugPatterns.length > 0) {
+                    knownPatternsContext = "\n\nConsider these known bug patterns during your review (summarized):\n";
+                    this.sharedAgentContext.knownBugPatterns.slice(0, 5).forEach((p: any) => { // Show top 5
+                        const patternDetail = (typeof p === 'string') ? p : `${p.name}: ${p.description.substring(0,100)}... (Severity: ${p.severity || 'N/A'})`;
+                        knownPatternsContext += `- ${patternDetail}\n`;
+                    });
+                }
+
+                const llmPrompt = `Perform a brief security review of the following code changes from a Chromium CL. Focus on common C++ pitfalls, IPC issues, or web security concerns. ${knownPatternsContext}\nBe concise. \n\n${diffSummaryForLlm}`;
+                const review = await this.llmComms.sendMessage(llmPrompt, "You are a Chromium security reviewer AI.");
+                return review;
+            }
+        }
+      ],
+      defaultParams: {}
+    };
+    this.registerWorkflow(basicClAuditWorkflow);
+
+    // --- Define "Targeted File Audit" Workflow ---
+    const targetedFileAuditWorkflow: WorkflowDefinition = {
+      id: "targeted-file-audit",
+      description: "Performs a detailed security analysis of a specific file: gathers context, scans for vulnerabilities, checks against known patterns, and synthesizes a report.",
+      steps: [
+        {
+          name: "Fetch File Content & Initial Context",
+          description: "Fetches file content and gets module/file context using CodebaseUnderstandingAgent.",
+          requiredParams: ["filePath"],
+          action: async (params) => {
+            const filePath = params.filePath;
+            const cuAgent = this.specializedAgents.get(SpecializedAgentType.CodebaseUnderstanding) as CodebaseUnderstandingAgent | undefined;
+            let contextSummary = `Analysis for file: ${filePath}\n`;
+            let fileContent = "";
+
+            try {
+              const fileData = await this.chromiumApi.getFile({ filePath });
+              fileContent = fileData.content;
+              contextSummary += `File Content (first 500 chars):\n${fileContent.substring(0, 500)}...\n\n`;
+            } catch (e) {
+              return JSON.stringify({ error: `Failed to fetch file ${filePath}: ${(e as Error).message}`, fileContent: "", moduleContext: "" });
+            }
+
+            if (cuAgent) {
+              const insight = await cuAgent.provideContextForFile(filePath); // This returns a string from LLM
+              contextSummary += `Codebase Context:\n${insight}\n`;
+              return JSON.stringify({ fileContent, moduleContext: insight, reportSection_Context: contextSummary});
+            } else {
+              contextSummary += "CodebaseUnderstandingAgent not available for deeper context.\n";
+              return JSON.stringify({ fileContent, moduleContext: "N/A", reportSection_Context: contextSummary });
+            }
+          }
+        },
+        {
+          name: "Proactive Vulnerability Scan",
+          description: "Analyzes the file content for potential vulnerabilities using ProactiveBugFinder logic and LLM, informed by context.",
+          requiredParams: ["filePath", "fileContent", "moduleContext"],
+          action: async (params) => {
+            const pbfAgent = this.specializedAgents.get(SpecializedAgentType.ProactiveBugFinding) as ProactiveBugFinder | undefined;
+            let scanResults = "";
+            if (pbfAgent) {
+              // The existing analyzeSpecificFile fetches content again.
+              // TODO: Optimization: Modify analyzeSpecificFile to optionally accept fileContent to avoid re-fetch.
+              scanResults = await pbfAgent.analyzeSpecificFile(params.filePath);
+            } else {
+              // Fallback to direct LLM call if PBF agent not available
+              console.warn("Targeted File Audit: ProactiveBugFinder agent not available, using direct LLM call for scan.");
+              const systemPrompt = "You are a security code auditor. Analyze the provided code from a Chromium file, considering its module context, for potential security vulnerabilities. Focus on common C++ pitfalls, IPC issues, or web security concerns. Be concise.";
+              // Ensure moduleContext is a string for the prompt. It might be an object if not handled carefully by previous step's stringify.
+              const contextString = typeof params.moduleContext === 'string' ? params.moduleContext : JSON.stringify(params.moduleContext);
+              const analysisPrompt = `File: ${params.filePath}\nModule Context:\n${contextString}\n\nCode (first 4000 chars):\n${params.fileContent.substring(0,4000)}\n\nIdentify potential vulnerabilities or areas needing closer inspection:`;
+              scanResults = await this.llmComms.sendMessage(analysisPrompt, systemPrompt);
+            }
+            return JSON.stringify({ potentialVulnerabilities: scanResults, reportSection_Scan: `Vulnerability Scan Results:\n${scanResults}\n` });
+          }
+        },
+        {
+          name: "Pattern Matching",
+          description: "Checks identified issues against known bug patterns using BugPatternAnalysisAgent.",
+          requiredParams: ["potentialVulnerabilities"], // Takes the text output from previous step
+          action: async (params) => {
+            const bpaAgent = this.specializedAgents.get(SpecializedAgentType.BugPatternAnalysis) as BugPatternAnalysisAgent | undefined;
+            let patternMatches = "BugPatternAnalysisAgent not available or no specific patterns matched.";
+            if (bpaAgent && params.potentialVulnerabilities) {
+              // Use getContextualAdvice with the summary of potential vulnerabilities
+              patternMatches = await bpaAgent.getContextualAdvice(params.potentialVulnerabilities.substring(0, 2000)); // Send a snippet of the vulnerabilities found
+            }
+            return JSON.stringify({ matchedPatterns: patternMatches, reportSection_Patterns: `Pattern Matching Results:\n${patternMatches}\n` });
+          }
+        },
+        {
+          name: "Synthesize Report",
+          description: "Combines all findings into a comprehensive security report for the file.",
+          requiredParams: ["filePath", "reportSection_Context", "reportSection_Scan", "reportSection_Patterns"],
+          action: async (params) => {
+            const synthesisPrompt = `
+Synthesize a security report for the Chromium file: ${params.filePath}
+Based on the following sections:
+
+1. Context and File Overview:
+${params.reportSection_Context}
+
+2. Vulnerability Scan Details:
+${params.reportSection_Scan}
+
+3. Known Pattern Matches:
+${params.reportSection_Patterns}
+
+Provide a final summary and overall assessment.
+If specific vulnerabilities were found, list them clearly.
+If no major issues, state that, but mention any minor concerns or areas for attention.
+Be factual and concise.
+`;
+            const finalReport = await this.llmComms.sendMessage(synthesisPrompt, "You are an AI security analyst compiling a report.");
+            return finalReport; // This is the final output of the workflow
+          }
+        }
+      ],
+      defaultParams: {}
+    };
+    this.registerWorkflow(targetedFileAuditWorkflow);
+
+    // TODO: Define more workflows like "New API Security Check"
+    console.log("Workflows initialized.");
+  }
+
   private initializeSpecializedAgents(): void {
     if (!this.chromiumApi) {
       console.warn("ChromiumAPI not initialized. Skipping specialized agent creation that depend on it.");
       return;
     }
-    // Pass necessary dependencies to agents
-    const bugFinder = new ProactiveBugFinder(this.llmComms, this.chromiumApi);
+    if (!this.agentConfig) {
+      console.error("AgentConfig not loaded. Cannot initialize specialized agents.");
+      throw new Error("AgentConfig not available during specialized agent initialization.");
+    }
+
+    // Pass necessary dependencies to agents, including the shared context and their specific configs
+    const bugFinder = new ProactiveBugFinder(
+      this.llmComms,
+      this.chromiumApi,
+      this.sharedAgentContext,
+      this.agentConfig.proactiveBugFinder
+    );
     this.specializedAgents.set(SpecializedAgentType.ProactiveBugFinding, bugFinder);
 
-    const patternAnalyzer = new BugPatternAnalysisAgent(this.llmComms, this.chromiumApi);
+    const patternAnalyzer = new BugPatternAnalysisAgent(
+      this.llmComms,
+      this.chromiumApi,
+      this.sharedAgentContext,
+      this.agentConfig.bugPatternAnalysis
+    );
     this.specializedAgents.set(SpecializedAgentType.BugPatternAnalysis, patternAnalyzer);
 
-    const codebaseUnderstander = new CodebaseUnderstandingAgent(this.llmComms, this.chromiumApi);
+    const codebaseUnderstander = new CodebaseUnderstandingAgent(
+      this.llmComms,
+      this.chromiumApi,
+      this.sharedAgentContext,
+      this.agentConfig.codebaseUnderstanding
+    );
     this.specializedAgents.set(SpecializedAgentType.CodebaseUnderstanding, codebaseUnderstander);
 
-    console.log("Specialized agents (ProactiveBugFinder, BugPatternAnalysisAgent, CodebaseUnderstandingAgent) initialized.");
+    console.log("Specialized agents (ProactiveBugFinder, BugPatternAnalysisAgent, CodebaseUnderstandingAgent) initialized with shared context and agent configurations.");
 
     // Optionally, auto-start some agents
     // bugFinder.start();
@@ -124,37 +350,59 @@ The user is interacting with you via a CLI chatbot.`;
 
     // --- Attempt to leverage specialized agents ---
 
-    // 1. Check if query relates to bug patterns or asks for advice on a snippet
-    if (query.toLowerCase().includes("pattern") || query.toLowerCase().includes("advice for code")) {
-      const bpaAgent = this.specializedAgents.get(SpecializedAgentType.BugPatternAnalysis) as BugPatternAnalysisAgent | undefined;
-      if (bpaAgent && (await bpaAgent.getStatus()).includes("Active")) { // Check if active
-        // A more sophisticated approach would be to parse the query for a code snippet
-        // For now, if "advice for code" is present, we'll just note its capability.
-        const patterns = bpaAgent.getLearnedPatterns();
-        if (patterns.length > 0) {
-          agentContributions += `\n[Context from BugPatternAnalysisAgent]:\nLearned Bug Patterns:\n - ${patterns.join("\n - ")}\n`;
+    // 1. Leverage BugPatternAnalysisAgent's knowledge from shared context
+    if (this.sharedAgentContext.knownBugPatterns && this.sharedAgentContext.knownBugPatterns.length > 0) {
+      // Provide a summary of a few patterns if query seems relevant
+      if (query.toLowerCase().includes("pattern") || query.toLowerCase().includes("vulnerability type")) {
+        const patternSample = this.sharedAgentContext.knownBugPatterns.slice(0, 3).map((p: any) => p.description || p).join("\n - ");
+        agentContributions += `\n[Context from BugPatternAnalysis]:\nRecent Bug Patterns:\n - ${patternSample}\n`;
+      }
+    }
+    // If user asks for advice on a code snippet, we'd ideally extract the snippet and use bpaAgent.getContextualAdvice(snippet)
+    // This part of specific invocation can remain or be enhanced.
+
+    // 2. Leverage CodebaseUnderstandingAgent's knowledge from shared context
+    const fileUnderstandQueryMatch = query.match(/(?:understand|info on|context for) (?:file|path|module) ([\w\/.-]+)/i);
+    if (fileUnderstandQueryMatch && fileUnderstandQueryMatch[1]) {
+      const filePathOrModule = fileUnderstandQueryMatch[1];
+      const insightsContext = this.sharedAgentContext.codebaseInsights; // No cast needed now
+
+      let insight = insightsContext[filePathOrModule];
+      if (!insight) {
+        const parentKey = Object.keys(insightsContext).find(k => filePathOrModule.startsWith(k + '/'));
+        if (parentKey) insight = insightsContext[parentKey];
+      }
+
+      if (insight) {
+        let insightSummary = `\n[Context from CodebaseUnderstanding for ${insight.modulePath}]:\nSummary: ${insight.summary.substring(0, 300)}...\n`;
+        if (insight.keyFiles && insight.keyFiles.length > 0) {
+          insightSummary += `Key Files: ${insight.keyFiles.slice(0,2).map(f => f.filePath).join(', ')}...\n`;
         }
-        // If a code snippet was extractable, we could call:
-        // const advice = await bpaAgent.getContextualAdvice(snippet);
-        // agentContributions += `\nBugPatternAnalysisAgent advice: ${advice}\n`;
+        if (insight.commonSecurityRisks && insight.commonSecurityRisks.length > 0) {
+          insightSummary += `Common Risks: ${insight.commonSecurityRisks.slice(0,2).join(', ')}...\n`;
+        }
+        agentContributions += insightSummary;
+      } else {
+        agentContributions += `\n[CodebaseUnderstanding]: No immediate detailed insight for ${filePathOrModule} in shared context. You can try tasking the agent to analyze it.\n`;
       }
     }
 
-    // 2. Check if query relates to understanding a specific file/module
-    const fileUnderstandQueryMatch = query.match(/understand(?: file)? ([\w\/.-]+)/i);
-    if (fileUnderstandQueryMatch && fileUnderstandQueryMatch[1]) {
-      const filePath = fileUnderstandQueryMatch[1];
-      const cuAgent = this.specializedAgents.get(SpecializedAgentType.CodebaseUnderstanding) as CodebaseUnderstandingAgent | undefined;
-      if (cuAgent && (await cuAgent.getStatus()).includes("Active")) {
-        const insight = await cuAgent.provideContextForFile(filePath);
-        agentContributions += `\n[Context from CodebaseUnderstandingAgent for ${filePath}]:\n${insight}\n`;
-      }
+    // 3. Include recent findings if query is general (e.g., "any new findings?", "latest security alerts")
+    if (query.toLowerCase().includes("latest findings") || query.toLowerCase().includes("new vulnerabilities") || query.toLowerCase().includes("security status")) {
+        if (this.sharedAgentContext.findings && this.sharedAgentContext.findings.length > 0) {
+            agentContributions += "\n[Recent Agent Findings]:\n";
+            // Show last 2-3 findings
+            this.sharedAgentContext.findings.slice(-3).forEach(finding => {
+                agentContributions += `- ${finding.sourceAgent} (${finding.type}): ${JSON.stringify(finding.data).substring(0,150)}...\n`;
+            });
+        }
     }
+
 
     // Add agent contributions to the main query for the LLM, if any
     if (agentContributions) {
-      enrichedQuery = `${query}\n\nRelevant information from specialized agents:\n${agentContributions}`;
-      console.log("LLMResearcher: Enriched query with agent contributions.");
+      enrichedQuery = `${query}\n\nRelevant information from active agents and shared context:\n${agentContributions}`;
+      console.log("LLMResearcher: Enriched query with agent contributions from shared context.");
     }
 
     try {
@@ -164,6 +412,12 @@ The user is interacting with you via a CLI chatbot.`;
 
       // TODO: Post-process LLM response, potentially trigger tools or other agents based on response.
       // For example, if LLM suggests analyzing a file, it could auto-task ProactiveBugFinder.
+
+    // Log recent findings from shared context for debugging/visibility
+    if (this.sharedAgentContext.findings.length > 0) {
+        // console.log(`LLMResearcher: Recent findings in shared context: ${JSON.stringify(this.sharedAgentContext.findings.slice(-3))}`);
+    }
+
       return llmResponse;
     } catch (error) {
       console.error("Error processing query in LLMResearcher:", error);
@@ -388,12 +642,33 @@ The user is interacting with you via a CLI chatbot.`;
   // --- Generic Task Agent Management ---
   private runningGenericTasks: Map<string, GenericTaskAgent> = new Map();
 
+  // --- Workflow Management ---
+  // Define types for workflows
+  type WorkflowStepAction = (params: any) => Promise<string>; // Action can be any async function returning a string summary
+
+  interface WorkflowStep {
+    name: string;
+    description: string;
+    action: WorkflowStepAction;
+    requiredParams?: string[]; // Parameters needed for this step's action
+  }
+
+  interface WorkflowDefinition {
+    id: string;
+    description: string;
+    steps: WorkflowStep[];
+    defaultParams?: Record<string, any>; // Default parameters for the workflow
+  }
+
+  private definedWorkflows: Map<string, WorkflowDefinition> = new Map();
+
+
   public async createAndRunGenericTask(config: GenericTaskAgentConfig): Promise<string> {
     if (!config.taskDescription || !config.llmPrompt) {
       return "Error: Generic task config must include 'taskDescription' and 'llmPrompt'.";
     }
 
-    const agent = new GenericTaskAgent(this.llmComms, config);
+    const agent = new GenericTaskAgent(this.llmComms, config, this.sharedAgentContext);
     this.runningGenericTasks.set(agent.id, agent);
 
     // Not awaiting start here, as it's a one-shot execution.
@@ -433,5 +708,83 @@ The user is interacting with you via a CLI chatbot.`;
       return `Task ${taskId} completed. Result:\n${result}`;
     }
     return `Task ${taskId} status: ${status}. No result yet, or task did not produce one.`;
+  }
+
+  // --- Workflow Execution ---
+  public registerWorkflow(definition: WorkflowDefinition): void {
+    if (this.definedWorkflows.has(definition.id)) {
+      console.warn(`Workflow with ID ${definition.id} is already registered. Overwriting.`);
+    }
+    this.definedWorkflows.set(definition.id, definition);
+    console.log(`Workflow registered: ${definition.id} - ${definition.description}`);
+  }
+
+  public async runWorkflow(workflowId: string, params: Record<string, any>): Promise<string> {
+    const workflow = this.definedWorkflows.get(workflowId);
+    if (!workflow) {
+      return `Workflow with ID '${workflowId}' not found. Available: ${Array.from(this.definedWorkflows.keys()).join(', ')}`;
+    }
+
+    console.log(`Starting workflow: ${workflow.id} with params: ${JSON.stringify(params)}`);
+    let fullReport = `Workflow Report for: ${workflow.id} (${workflow.description})\n`;
+    fullReport += `Parameters: ${JSON.stringify(params)}\n\n`;
+
+    const mergedParams = { ...workflow.defaultParams, ...params };
+
+    for (const step of workflow.steps) {
+      fullReport += `--- Step: ${step.name} ---\n`;
+      console.log(`Executing step: ${step.name}`);
+
+      // Check for required parameters for the step
+      if (step.requiredParams) {
+        for (const reqParam of step.requiredParams) {
+          if (!(reqParam in mergedParams)) {
+            const errorMsg = `Error: Missing required parameter '${reqParam}' for step '${step.name}' in workflow '${workflowId}'.`;
+            console.error(errorMsg);
+            fullReport += `${errorMsg}\nWorkflow terminated prematurely.\n`;
+            return fullReport;
+          }
+        }
+      }
+
+      try {
+        const stepResult = await step.action(mergedParams);
+        fullReport += `Description: ${step.description}\nResult:\n${stepResult}\n\n`;
+        // Check if stepResult (potentially JSON string) contains data to merge into params for subsequent steps
+        try {
+            const stepOutputData = JSON.parse(stepResult);
+            if (typeof stepOutputData === 'object' && stepOutputData !== null) {
+                // console.log(`Merging output from step ${step.name} into workflow params:`, stepOutputData);
+                Object.assign(mergedParams, stepOutputData); // Merge results for next steps
+            }
+        } catch (e) {
+            // Not JSON, or not an object, so don't attempt to merge.
+        }
+
+      } catch (error) {
+        const errorMsg = `Error during step '${step.name}': ${(error as Error).message}`;
+        console.error(errorMsg, (error as Error).stack);
+        fullReport += `Error: ${errorMsg}\nWorkflow execution halted.\n`;
+        return fullReport; // Halt workflow on error
+      }
+    }
+
+    fullReport += "--- Workflow Completed Successfully ---\n";
+    console.log(`Workflow ${workflow.id} completed.`);
+    return fullReport;
+  }
+
+  public getAvailableWorkflows(): string {
+    if (this.definedWorkflows.size === 0) {
+      return "No workflows defined.";
+    }
+    let info = "Available workflows:\n";
+    this.definedWorkflows.forEach(wf => {
+      info += `- ${wf.id}: ${wf.description}\n`;
+      // wf.steps.forEach(step => {
+      //   info += `  - Step: ${step.name} (${step.description})\n`;
+      // });
+    });
+    return info;
   }
 }
