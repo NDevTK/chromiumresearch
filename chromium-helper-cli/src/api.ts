@@ -244,48 +244,28 @@ export class ChromiumAPI {
         startLine = start + 1;
       }
       
-      const lines = fileContent.split('\n'); // Still useful for totalLines
-      let outputContent: string;
-      let displayedLinesCount: number;
-
-      if (lineStart === undefined) {
-        // No lineStart specified, return raw, un-numbered content
-        outputContent = fileContent;
-        displayedLinesCount = lines.length;
-      } else {
-        // lineStart is provided, proceed with numbering and slicing (original logic)
-        let displayLinesArr = lines;
-        let actualStartDisplayLineNum = 1;
-
-        const startIdx = Math.max(1, lineStart) - 1;
-        const endIdx = lineEnd ? Math.min(lines.length, lineEnd) : lines.length;
-        displayLinesArr = lines.slice(startIdx, endIdx);
-        actualStartDisplayLineNum = startIdx + 1;
-
-        outputContent = displayLinesArr.map((line, index) => {
-          const lineNum = (actualStartDisplayLineNum + index).toString().padStart(4, ' ');
-          return `${lineNum}  ${line}`;
-        }).join('\n');
-        displayedLinesCount = displayLinesArr.length;
-      }
+      // Format content with line numbers
+      const numberedLines = displayLines.map((line, index) => {
+        const lineNum = (startLine + index).toString().padStart(4, ' ');
+        return `${lineNum}  ${line}`;
+      }).join('\n');
       
+      // Create browser URL for reference
       let browserUrl = `https://source.chromium.org/chromium/chromium/src/+/main:${filePath}`;
-      // Construct URL that makes sense for the returned content
-      if (lineStart !== undefined) { // If a range was requested, reflect it in URL
+      if (lineStart) {
         browserUrl += `;l=${lineStart}`;
-        if (lineEnd && lineEnd > lineStart) {
+        if (lineEnd) {
           browserUrl += `-${lineEnd}`;
         }
       }
-      // If raw content (no lineStart), the URL points to the file without specific lines.
       
       return {
         filePath,
-        content: outputContent,
+        content: numberedLines,
         totalLines: lines.length,
-        displayedLines: displayedLinesCount,
-        lineStart, // Reflect what was requested
-        lineEnd,   // Reflect what was requested
+        displayedLines: displayLines.length,
+        lineStart,
+        lineEnd,
         browserUrl
       };
       
