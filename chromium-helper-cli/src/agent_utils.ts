@@ -8,3 +8,12 @@ import crypto from 'node:crypto';
 export function computeSha256Hash(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
+
+/**
+ * Escapes special characters in a string for use in a regular expression.
+ * @param str The string to escape.
+ * @returns The escaped string.
+ */
+export function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
+}

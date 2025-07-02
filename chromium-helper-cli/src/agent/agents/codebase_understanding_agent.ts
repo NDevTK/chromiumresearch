@@ -8,9 +8,15 @@ import {
     SpecializedAgentType,
     SharedAgentContextType,
     ProcessedItemsHistory,
-    CodebaseModuleInsight, // For type hints
-    AnalyzedCommitInfo,    // For type hints
-    KeyFileWithSymbols     // For type hints
+    CodebaseModuleInsight,
+    AnalyzedCommitInfo,
+    KeyFileWithSymbols,
+    ContextualAdvice,
+    ContextualAdviceType,
+    FilePathAdvice,
+    RegexAdvice,
+    GeneralAdvice,
+    SymbolInfo
 } from './types.js'; // Import from new types.ts
 
 export class CodebaseUnderstandingAgent implements SpecializedAgent {
@@ -33,15 +39,34 @@ export class CodebaseUnderstandingAgent implements SpecializedAgent {
     this.setSharedContext(sharedContext); console.log("Codebase Understanding agent initialized."); this.loadState();
   }
 
-  public setSharedContext(context: SharedAgentContextType): void { this.sharedContext = context; if(!this.sharedContext.codebaseInsights) this.sharedContext.codebaseInsights = {}; }
+  public setSharedContext(context: SharedAgentContextType): void {
+    this.sharedContext = context;
+    if(!this.sharedContext.codebaseInsights) this.sharedContext.codebaseInsights = {};
+    if(!this.sharedContext.contextualAdvice) this.sharedContext.contextualAdvice = [];
+  }
 
   private async loadState(): Promise<void> {
-    const state = await this.storage.loadData<{ lastAnalysis?: string; insights?: Record<string, CodebaseModuleInsight>; processedItemsHistory?: ProcessedItemsHistory; }>();
+    const state = await this.storage.loadData<{
+        lastAnalysis?: string;
+        insights?: Record<string, CodebaseModuleInsight>;
+        processedItemsHistory?: ProcessedItemsHistory;
+        contextualAdviceCUA?: ContextualAdvice[];
+    }>();
     if (state) {
       if (state.lastAnalysis) this.lastModuleAnalysis = new Date(state.lastAnalysis);
       if (state.insights) this.sharedContext.codebaseInsights = state.insights;
       this.processedItemsHistory = state.processedItemsHistory || {};
-      console.log(`CUA: Loaded ${Object.keys(this.sharedContext.codebaseInsights).length} insights, ${Object.keys(this.processedItemsHistory).length} processed modules.`);
+
+      // Load and merge contextual advice
+      const loadedAdvice = state.contextualAdviceCUA || [];
+      const existingAdviceIds = new Set(this.sharedContext.contextualAdvice?.map(a => a.adviceId) || []);
+      loadedAdvice.forEach(advice => {
+        if (!existingAdviceIds.has(advice.adviceId)) {
+          this.sharedContext.contextualAdvice?.push(advice);
+          existingAdviceIds.add(advice.adviceId);
+        }
+      });
+      console.log(`CUA: Loaded ${Object.keys(this.sharedContext.codebaseInsights).length} insights, ${Object.keys(this.processedItemsHistory).length} processed modules. Loaded ${loadedAdvice.length} CUA-specific contextual advice items.`);
     }
   }
 
@@ -52,11 +77,17 @@ export class CodebaseUnderstandingAgent implements SpecializedAgent {
         const sorted = keys.sort((a,b) => new Date(this.processedItemsHistory[a].lastAnalyzed).getTime() - new Date(this.processedItemsHistory[b].lastAnalyzed).getTime());
         for(let i=0; i < keys.length - maxItems; i++) delete this.processedItemsHistory[sorted[i]];
     }
+
+    // Filter and save only CUA-generated advice
+    const cuaGeneratedAdvice = this.sharedContext.contextualAdvice?.filter(a => a.sourceAgent === this.type) || [];
+
     await this.storage.saveData({
         lastAnalysis: this.lastModuleAnalysis?.toISOString(),
         insights: this.sharedContext.codebaseInsights,
-        processedItemsHistory: this.processedItemsHistory
+        processedItemsHistory: this.processedItemsHistory,
+        contextualAdviceCUA: cuaGeneratedAdvice
     });
+    console.log(`CUA: Saved state. CUA-specific advice items saved: ${cuaGeneratedAdvice.length}`);
   }
 
   public async start(): Promise<void> {
@@ -83,20 +114,24 @@ export class CodebaseUnderstandingAgent implements SpecializedAgent {
     return s;
   }
 
-  private parseOwnersFileContent(content: string): string[] {
-    const owners: string[] = [];
-    const lines = content.split('\n');
-    for (const line of lines) {
-      const trimmedLine = line.trim();
-      if (trimmedLine.startsWith('#') || trimmedLine === '') continue;
-      if (trimmedLine.startsWith('per-file')) continue;
-      if (trimmedLine === '*') continue;
-      if (trimmedLine.includes('@')) {
-        owners.push(trimmedLine.split(' ')[0]);
-      }
-    }
-    return owners;
-  }
+  // private parseOwnersFileContent(content: string): string[] { // No longer needed
+  //   const owners: string[] = [];
+  //   const lines = content.split('\n');
+  //   for (const line of lines) {
+  //     const contentLine = line.replace(/^\s*\d+\s*/, '');
+  //     const trimmedLine = contentLine.trim();
+  //     if (trimmedLine.startsWith('#') || trimmedLine === '') continue;
+  //     if (trimmedLine.startsWith('per-file')) continue;
+  //     if (trimmedLine === '*') continue;
+  //     if (trimmedLine.includes('@')) {
+  //       owners.push(trimmedLine.split(' ')[0].split(',')[0]);
+  //     } else if (trimmedLine) {
+  //       if (!trimmedLine.includes(' ') && !trimmedLine.includes(':')) {
+  //       }
+  //     }
+  //   }
+  //   return owners.filter(owner => owner.includes('@'));
+  // }
 
   private async runContinuousModuleAnalysisLoop(): Promise<void> {
     console.log("CUA: Entered continuous module analysis loop.");
@@ -145,18 +180,15 @@ export class CodebaseUnderstandingAgent implements SpecializedAgent {
     }
 
     try {
-      const targetModulePath = modulePath;
+      const targetModulePathClean = modulePath.endsWith('/') ? modulePath.slice(0, -1) : modulePath;
       let primaryOwners: string[] = [];
       try {
-          const rawOwnersContentResponse = await fetch(`https://chromium.googlesource.com/chromium/src/+/main/${ownersResults[0].file}?format=TEXT`);
-          if (rawOwnersContentResponse.ok) {
-            const base64Content = await rawOwnersContentResponse.text();
-            const rawOwnersContent = Buffer.from(base64Content, 'base64').toString('utf-8');
-            primaryOwners = this.parseOwnersFileContent(rawOwnersContent);
-          } else {
-            console.warn(`CUA: Failed to fetch raw OWNERS content for ${ownersResults[0].file} via direct fetch.`);
-          }
-      } catch (e) { console.error(`CUA: Error fetching or parsing OWNERS for ${targetModulePath}:`, e); }
+        // Use a dummy file name in the module path to get directory-level owners
+        primaryOwners = await this.chromiumApi.getOwners(`${targetModulePathClean}/.dummy_file_for_module_owners`);
+        console.log(`CUA: Successfully fetched ${primaryOwners.length} module owners for ${targetModulePathClean}`);
+      } catch (e) {
+        console.warn(`CUA: Error fetching module owners for ${targetModulePathClean}:`, (e as Error).message);
+      }
 
       let mojoInterfaces: SearchResult[] = [];
       try {
@@ -212,9 +244,11 @@ ${ipcHandlers.map(r => `  - ${r.file} (line ${r.line})`).join('\n') || '  N/A'}
 - Recent Significant Commits:
 ${recentCommits.map(c => `  - ${c.subject} (Author: ${c.author}, Date: ${c.date})`).join('\n') || '  N/A'}
 
-Output a JSON object matching the CodebaseModuleInsight structure, focusing on:
-"summary": (string)
-"keyFiles": [{ "filePath": string, "description": string, "primaryPurpose": string, "owners": string[] (if discernible) }] (List up to 3-5 key files)
+Output a JSON object matching the CodebaseModuleInsight structure.
+For "keyFiles", you will be given files with their paths, owners, and recent commit summaries. Your main task for keyFiles is to provide their "description" and "primaryPurpose".
+Focus on:
+"summary": (string) - Overall module summary.
+"keyFiles": [{ "filePath": string (pre-identified), "description": string (your task), "primaryPurpose": string (your task), "owners": string[] (pre-identified), "recentCommitSummary": string[] (pre-identified) }] (Describe 3-5 key files provided in the input data)
 "interactionPoints": [{ "type": "mojo_interface" | "ipc_handler" | "public_api", "name": string, "filePath": string }]
 "keyTechnologies": string[]
 "commonSecurityRisks": string[]
@@ -229,19 +263,41 @@ Output a JSON object matching the CodebaseModuleInsight structure, focusing on:
 
       let initialKeyFiles: KeyFileWithSymbols[] = insightData.keyFiles || [];
 
-      // Step 2: Iterate through key files to identify and enrich symbols
+      // Step 2: Iterate through key files to identify and enrich symbols, get owners, and history
       for (let keyFile of initialKeyFiles) {
         if (!keyFile.filePath) continue;
-        keyFile.identifiedSymbols = keyFile.identifiedSymbols || []; // Ensure array exists
+
+        // Get specific owners for the key file
+        try {
+          keyFile.owners = await this.chromiumApi.getOwners(keyFile.filePath);
+        } catch (e) {
+          console.warn(`CUA: Error fetching owners for key file ${keyFile.filePath}: ${(e as Error).message}`);
+          keyFile.owners = [];
+        }
+
+        // Get recent commit history for the key file
+        try {
+          const historyLimit = this.config.maxCommitsForKeyFileHistoryCUA || 3;
+          const historyData = await this.chromiumApi.searchCommits({ query: `path:${keyFile.filePath}`, limit: historyLimit });
+          if (historyData && historyData.log && historyData.log.length > 0) {
+            keyFile.recentCommitSummary = historyData.log.map(commit =>
+              `${commit.commit.substring(0,7)}: ${commit.message.split('\n')[0].substring(0, 70)}... (Author: ${commit.author?.email}, Date: ${commit.author?.time})`
+            );
+          } else {
+            keyFile.recentCommitSummary = [];
+          }
+        } catch (e) {
+          console.warn(`CUA: Error fetching commit history for key file ${keyFile.filePath}: ${(e as Error).message}`);
+          keyFile.recentCommitSummary = [];
+        }
+
+        keyFile.identifiedSymbols = keyFile.identifiedSymbols || [];
 
         try {
           console.log(`CUA: Identifying symbols for key file: ${keyFile.filePath}`);
           const fileData = await this.chromiumApi.getFile({ filePath: keyFile.filePath});
           if (!fileData || !fileData.content) continue;
 
-          // Step 3a: LLM call or Regex to identify 1-2 prominent symbols in this file's content
-          // For simplicity, let's assume an LLM call. This could be slow.
-          // A regex for `class Foo` or `void Bar()` could be a faster first pass.
           const symbolIdPromptSystem = "You are a code analyzer. Identify up to 2 prominent class or function definition names from the provided C++ code snippet. Output as a JSON array of strings: [\"SymbolName1\", \"SymbolName2\"]. If none, output [].";
           const symbolIdPromptUser = `Code from ${keyFile.filePath} (first 2000 chars):\n${fileData.content.substring(0, 2000)}\n\nIdentify prominent class/function definition names (max 2):`;
           let symbolNames: string[] = [];
@@ -252,30 +308,46 @@ Output a JSON object matching the CodebaseModuleInsight structure, focusing on:
             console.warn(`CUA: Failed to parse symbol names from LLM for ${keyFile.filePath}: ${e}`);
           }
 
-          // Step 3b & 3c: For each identified symbol, call findSymbol and populate SymbolInfo
-          for (const symbolName of symbolNames.slice(0, 2)) { // Limit to 2 symbols per file
+          for (const symbolName of symbolNames.slice(0, 2)) {
             if (!symbolName || typeof symbolName !== 'string') continue;
             try {
               console.log(`CUA: Calling findSymbol for ${symbolName} in ${keyFile.filePath}`);
               const symbolDetails = await this.chromiumApi.findSymbol(symbolName, keyFile.filePath);
-
               let defLocation: string | undefined = undefined;
               if (symbolDetails.definition) {
                 defLocation = `${symbolDetails.definition.file}:${symbolDetails.definition.line}`;
               } else if (symbolDetails.symbolResults && symbolDetails.symbolResults.length > 0) {
-                // Fallback to first symbolResult if direct definition not found
                 defLocation = `${symbolDetails.symbolResults[0].file}:${symbolDetails.symbolResults[0].line}`;
               }
-
-
               const symbolInfo: SymbolInfo = {
                 name: symbolName,
                 type: symbolDetails.classResults.length > 0 ? 'class' : (symbolDetails.functionResults.length > 0 ? 'function' : 'symbol'),
                 definitionLocation: defLocation,
                 referenceCount: symbolDetails.estimatedUsageCount,
-                // Description could be a summary of findSymbol results or another LLM call if needed
-                description: `A symbol named ${symbolName}. Definition: ${defLocation || 'N/A'}. Estimated Usages: ${symbolDetails.estimatedUsageCount || 0}.`
+                description: `A symbol named ${symbolName}. Definition: ${defLocation || 'N/A'}. Estimated Usages: ${symbolDetails.estimatedUsageCount || 0}.`,
+                definitionBlame: undefined // Initialize
               };
+
+              // Get blame for the definition line
+              if (defLocation) {
+                try {
+                  const lineNumStr = defLocation.split(':').pop();
+                  if (lineNumStr) {
+                    const lineNum = parseInt(lineNumStr, 10);
+                    const blameData = await this.chromiumApi.getBlame(keyFile.filePath);
+                    const lineBlame = blameData.find(b => b.line === lineNum);
+                    if (lineBlame) {
+                      symbolInfo.definitionBlame = {
+                        rev: lineBlame.rev,
+                        author: lineBlame.author,
+                        date: lineBlame.date,
+                      };
+                    }
+                  }
+                } catch (blameError) {
+                  console.warn(`CUA: Error getting blame for symbol ${symbolName} in ${keyFile.filePath} at ${defLocation}: ${(blameError as Error).message}`);
+                }
+              }
               keyFile.identifiedSymbols.push(symbolInfo);
             } catch (e) {
               console.warn(`CUA: Error calling findSymbol for ${symbolName} in ${keyFile.filePath}: ${(e as Error).message}`);
@@ -287,7 +359,7 @@ Output a JSON object matching the CodebaseModuleInsight structure, focusing on:
       }
 
       const finalInsight: CodebaseModuleInsight = {
-        modulePath: targetModulePath,
+        modulePath: targetModulePathClean,
         summary: insightData.summary || "Summary not generated.",
         primaryOwners: primaryOwners,
         keyFiles: initialKeyFiles, // Now enriched with symbols
@@ -305,14 +377,16 @@ Output a JSON object matching the CodebaseModuleInsight structure, focusing on:
         analysisTypes: [this.ANALYSIS_TYPE_MODULE],
       };
 
+      this.generateAndStoreContextualAdvice(finalInsight);
+
       this.lastModuleAnalysis = new Date();
       await this.saveState();
-      console.log(`CUA: Analysis complete for module ${targetModulePath}. Insight stored.`);
+      console.log(`CUA: Analysis complete for module ${targetModulePath}. Insight and advice stored.`);
 
       this.sharedContext.findings.push({
         sourceAgent: this.type,
         type: "ModuleInsightUpdated",
-        data: { modulePath: targetModulePath, summary: newInsight.summary.substring(0,150)+"...", lastAnalyzed: newInsight.lastAnalyzed },
+        data: { modulePath: targetModulePath, summary: finalInsight.summary.substring(0,150)+"...", lastAnalyzed: finalInsight.lastAnalyzed },
         timestamp: new Date()
       });
 
@@ -473,5 +547,166 @@ Output a JSON object matching the CodebaseModuleInsight structure, focusing on:
       console.error(`CUA: Error providing context for file ${filePath}:`, error);
       return `Sorry, I encountered an error trying to get context for ${filePath}: ${(error as Error).message}`;
     }
+  }
+
+  private generateAndStoreContextualAdvice(insight: CodebaseModuleInsight): void {
+    if (!this.sharedContext.contextualAdvice) {
+      this.sharedContext.contextualAdvice = [];
+    }
+
+    // 1. FilePathAdvice for the module path
+    const moduleAdvice: FilePathAdvice = {
+      adviceId: `cua-fp-${insight.modulePath}-${Date.now()}`,
+      sourceAgent: this.type,
+      type: ContextualAdviceType.FilePath,
+      pathPattern: insight.modulePath,
+      advice: `This module (${insight.modulePath}) deals with: ${insight.summary.substring(0, 100)}... Key technologies: ${(insight.keyTechnologies || []).join(', ')}. Common risks: ${(insight.commonSecurityRisks || []).join(', ')}.`,
+      priority: 7,
+      createdAt: new Date().toISOString(),
+    };
+    this.sharedContext.contextualAdvice.push(moduleAdvice);
+
+    // 2. RegexAdvice or GeneralAdvice from key technologies or common security risks
+    (insight.keyTechnologies || []).forEach(tech => {
+      let regexPattern: string | undefined;
+      let generalAdvice: string | undefined;
+      const adviceBase = `Module ${insight.modulePath} uses ${tech}.`;
+
+      if (tech.toLowerCase().includes("mojo")) {
+        regexPattern = `(\\w+)::\\w*MojomTraits`; // Example regex for Mojo traits
+        generalAdvice = `${adviceBase} Pay attention to Mojo interface definitions (*.mojom files), message validation, and data serialization/deserialization. Look for potential issues in StructTraits or TypeConverter implementations.`;
+      } else if (tech.toLowerCase().includes("ipc")) {
+        regexPattern = `IPC_MESSAGE_HANDLER[_CONTENTS*]?\\s*\\(`; // Example regex for IPC message handlers
+        generalAdvice = `${adviceBase} Scrutinize IPC message handlers (IPC_MESSAGE_HANDLER) for proper validation of untrusted data from other processes. Check for integer overflows, out-of-bounds accesses, and correct message routing.`;
+      }
+
+      if (regexPattern) {
+        const advice: RegexAdvice = {
+          adviceId: `cua-rgx-${insight.modulePath}-${tech}-${Date.now()}`,
+          sourceAgent: this.type,
+          type: ContextualAdviceType.Regex,
+          regexPattern: regexPattern,
+          advice: generalAdvice || `${adviceBase} When you see code matching '${regexPattern}', consider related security implications of ${tech}.`,
+          description: `Regex for ${tech} usage in ${insight.modulePath}`,
+          priority: 6,
+          createdAt: new Date().toISOString(),
+        };
+        this.sharedContext.contextualAdvice.push(advice);
+      } else if (generalAdvice) {
+        const advice: GeneralAdvice = {
+          adviceId: `cua-gen-${insight.modulePath}-${tech}-${Date.now()}`,
+          sourceAgent: this.type,
+          type: ContextualAdviceType.General,
+          advice: generalAdvice,
+          keywords: [tech.toLowerCase(), insight.modulePath],
+          description: `General advice for ${tech} in ${insight.modulePath}`,
+          priority: 5,
+          createdAt: new Date().toISOString(),
+        };
+        this.sharedContext.contextualAdvice.push(advice);
+      }
+    });
+
+    (insight.commonSecurityRisks || []).forEach(risk => {
+      const advice: GeneralAdvice = {
+        adviceId: `cua-risk-${insight.modulePath}-${risk.substring(0,10)}-${Date.now()}`,
+        sourceAgent: this.type,
+        type: ContextualAdviceType.General,
+        advice: `Module ${insight.modulePath} has a common security risk: ${risk}. Be vigilant for patterns related to this risk when reviewing code in this module.`,
+        keywords: [risk.toLowerCase().replace(/\s+/g, '_'), insight.modulePath],
+        description: `Security risk: ${risk} in ${insight.modulePath}`,
+        priority: 8, // Higher priority for identified risks
+        createdAt: new Date().toISOString(),
+      };
+      this.sharedContext.contextualAdvice.push(advice);
+    });
+
+    // 3. Advice from Key Symbols with Blame
+    insight.keyFiles.forEach(keyFile => {
+      (keyFile.identifiedSymbols || []).forEach(symbol => {
+        if (symbol.definitionBlame && symbol.definitionLocation) {
+          const blame = symbol.definitionBlame;
+          const adviceText = `In ${keyFile.filePath}, symbol '${symbol.name}' (defined around line ${symbol.definitionLocation.split(':').pop()}) was last modified by commit ${blame.rev.substring(0,7)} (Author: ${blame.author}, Date: ${blame.date}). This context might be relevant when reviewing its usage or implementation. Original definition line: ${symbol.description?.split('Definition: ')[1]?.split('.')[0]}`;
+
+          const symbolAdvice: GeneralAdvice = {
+            adviceId: `cua-symblame-${symbol.name}-${keyFile.filePath.replace(/[\/\.]/g, '-')}-${Date.now()}`,
+            sourceAgent: this.type,
+            type: ContextualAdviceType.General,
+            advice: adviceText,
+            keywords: [symbol.name, keyFile.filePath.split('/').pop() || keyFile.filePath],
+            description: `Blame context for symbol ${symbol.name} in ${keyFile.filePath}`,
+            priority: 4, // Lower priority than module-level risks, but still useful context
+            createdAt: new Date().toISOString(),
+          };
+          this.sharedContext.contextualAdvice.push(symbolAdvice);
+        }
+      });
+    });
+
+
+    // Clean up old advice from this agent to prevent unbounded growth
+    // Keep only the latest N pieces of advice from CUA
+    const maxCuaAdvice = this.config.maxContextualAdviceItemsPerAgentCUA || 20; // Default was 50, let's use the config value or a fallback.
+
+    // 4. Module-level advice from commit history analysis
+    if (insight.recentSignificantCommits && insight.recentSignificantCommits.length > 0) {
+        const pathFrequency: Record<string, number> = {};
+        const themeKeywords = ["refactor", "fix", "bug", "deprecate", "add", "new", "performance", "security", "cleanup", "update"];
+        const themeFrequency: Record<string, number> = {};
+
+        insight.recentSignificantCommits.forEach(commit => {
+            // Path churn (simplified: look at first path segment within module)
+            (commit.keyFilesChanged || []).forEach(filePath => {
+                if (filePath.startsWith(insight.modulePath)) {
+                    const relativePath = filePath.substring(insight.modulePath.length).split('/').filter(p => p);
+                    if (relativePath.length > 0) {
+                        const subPath = insight.modulePath + (insight.modulePath.endsWith('/') ? '' : '/') + relativePath[0];
+                        pathFrequency[subPath] = (pathFrequency[subPath] || 0) + 1;
+                    }
+                }
+            });
+            // Theme keywords
+            themeKeywords.forEach(theme => {
+                if (commit.subject.toLowerCase().includes(theme)) {
+                    themeFrequency[theme] = (themeFrequency[theme] || 0) + 1;
+                }
+            });
+        });
+
+        const sortedPaths = Object.entries(pathFrequency).sort((a,b) => b[1] - a[1]);
+        if (sortedPaths.length > 0 && sortedPaths[0][1] > 1) { // Only if a path mentioned more than once
+            const topPaths = sortedPaths.slice(0, 2).map(p => p[0]);
+            const pathChurnAdvice: GeneralAdvice = {
+                adviceId: `cua-churn-${insight.modulePath.replace(/[\/\.]/g, '-')}-${Date.now()}`,
+                sourceAgent: this.type, type: ContextualAdviceType.General,
+                advice: `Module ${insight.modulePath} has seen recent commit activity concentrated in sub-paths like: ${topPaths.join(', ')}. Consider these areas for focused review.`,
+                keywords: [insight.modulePath, ...topPaths],
+                description: `Path churn analysis for ${insight.modulePath}`, priority: 5, createdAt: new Date().toISOString(),
+            };
+            this.sharedContext.contextualAdvice.push(pathChurnAdvice);
+        }
+
+        const sortedThemes = Object.entries(themeFrequency).sort((a,b) => b[1] - a[1]);
+        if (sortedThemes.length > 0 && sortedThemes[0][1] > 1) {
+            const topThemes = sortedThemes.slice(0, 2).map(t => t[0]);
+            const themeAdvice: GeneralAdvice = {
+                adviceId: `cua-themes-${insight.modulePath.replace(/[\/\.]/g, '-')}-${Date.now()}`,
+                sourceAgent: this.type, type: ContextualAdviceType.General,
+                advice: `Recent commit themes for module ${insight.modulePath} include: '${topThemes.join("', '")}'. This might indicate ongoing work in these areas.`,
+                keywords: [insight.modulePath, ...topThemes],
+                description: `Commit theme analysis for ${insight.modulePath}`, priority: 4, createdAt: new Date().toISOString(),
+            };
+            this.sharedContext.contextualAdvice.push(themeAdvice);
+        }
+    }
+
+    const cuaAdviceEntries = this.sharedContext.contextualAdvice.filter(a => a.sourceAgent === this.type);
+    if (cuaAdviceEntries.length > maxCuaAdvice) {
+        cuaAdviceEntries.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()); // Sort newest first
+        const adviceToRemove = cuaAdviceEntries.slice(maxCuaAdvice).map(a => a.adviceId);
+        this.sharedContext.contextualAdvice = this.sharedContext.contextualAdvice.filter(a => !adviceToRemove.includes(a.adviceId));
+    }
+
+    console.log(`CUA: Generated ${this.sharedContext.contextualAdvice.filter(a => a.sourceAgent === this.type).length} contextual advice items for module ${insight.modulePath}.`);
   }
 }

@@ -9,8 +9,14 @@ import {
     SpecializedAgentType,
     SharedAgentContextType,
     ProcessedItemsHistory,
-    CodebaseUnderstandingAgent // Added for type hint when accessing CUA from shared context
+    CodebaseUnderstandingAgent,
+    ContextualAdvice,
+    ContextualAdviceType,
+    RegexAdvice,
+    FilePathAdvice,
+    GeneralAdvice
 } from './types.js'; // Import from new types.ts
+import { computeSha256Hash } from '../../agent_utils.js';
 
 // --- ProactiveBugFinder ---
 export class ProactiveBugFinder implements SpecializedAgent {
@@ -113,12 +119,27 @@ export class ProactiveBugFinder implements SpecializedAgent {
             this.processedItemsHistory[targetFile.file] = existingEntry;
             await this.saveState();
           } else {
+            const relevantAdvice = this.getRelevantContextualAdvice(targetFile.file, fileData.content);
+            let adviceTextForPrompt = "";
+            if (relevantAdvice.length > 0) {
+                console.log(`PBF: Found ${relevantAdvice.length} relevant advice items for ${targetFile.file}. Top item: "${relevantAdvice[0].advice.substring(0, 50)}..." (ID: ${relevantAdvice[0].adviceId})`);
+                adviceTextForPrompt = "\n\n--- Relevant Contextual Advice ---\n";
+                relevantAdvice.forEach(advice => {
+                    adviceTextForPrompt += `- (${advice.type} from ${advice.sourceAgent}): ${advice.advice}\n`;
+                    if (advice.type === ContextualAdviceType.Regex && 'regexPattern' in advice) {
+                         adviceTextForPrompt += `  (Consider if pattern "${(advice as RegexAdvice).regexPattern}" matches anywhere in the code.)\n`;
+                    }
+                });
+                adviceTextForPrompt += "--- End Contextual Advice ---\n";
+            }
+
             let cuaContextText = "";
             const cua = this.sharedContext.specializedAgents?.get(SpecializedAgentType.CodebaseUnderstanding) as CodebaseUnderstandingAgent | undefined;
             if (cua) {
                 try {
                     console.log(`PBF: Fetching CUA context for ${targetFile.file} during continuous analysis.`);
-                    cuaContextText = await cua.provideContextForFile(targetFile.file, fileData.content.substring(0, 500));
+                    const snippetForCua = fileData.content.length > 2000 ? fileData.content.substring(0, 2000) : fileData.content;
+                    cuaContextText = await cua.provideContextForFile(targetFile.file, snippetForCua);
                     if (cuaContextText) {
                         cuaContextText = `\n\n--- Context from CodebaseUnderstandingAgent ---\n${cuaContextText}\n--- End CUA Context ---\n`;
                     }
@@ -127,16 +148,29 @@ export class ProactiveBugFinder implements SpecializedAgent {
                 }
             }
 
-            const analysisSystemPrompt = "You are an expert Chromium security auditor. Your task is to analyze the provided C++ code snippet for potential vulnerabilities. Pay close attention to any module context provided by the CodebaseUnderstandingAgent, as it may highlight relevant risks or technologies.";
-            const analysisUserPrompt = `File to analyze: ${targetFile.file}\n${cuaContextText}File content (first 4000 chars):\n\`\`\`cpp\n${fileData.content.substring(0,4000)}\n\`\`\`\n\nTask: Identify potential security vulnerabilities in the code snippet above. Consider common C++ pitfalls, IPC issues, memory safety, UAF, race conditions, and web security concerns relevant to Chromium. Rate the severity of each identified issue (Critical, High, Medium, Low). Be concise in your analysis. If you identify a specific risky function call or code pattern that might appear elsewhere, also output it on a new line formatted as: SEARCHABLE_PATTERN: <pattern_to_search_for_globally_in_codesearch>`;
+            const { blameSummary, historySummary } = await this.getExtendedFileContextForLLM(targetFile.file, fileData.content);
+
+            const analysisSystemPrompt = "You are an expert Chromium security auditor. Analyze the provided C++ code for vulnerabilities. Consider context from CodebaseUnderstandingAgent, contextual advice, blame information, and file history. Highlight if any of these were particularly relevant to your findings.";
+            const analysisUserPrompt = `File: ${targetFile.file}\n${cuaContextText}${adviceTextForPrompt}${blameSummary}${historySummary}File content (first 4000 chars):\n\`\`\`cpp\n${fileData.content.substring(0,4000)}\n\`\`\`\n\nTask: Identify potential security vulnerabilities. Rate severity (Critical, High, Medium, Low). Be concise. If a specific pattern is risky globally, output: SEARCHABLE_PATTERN: <pattern_to_search_for_globally_in_codesearch>`;
             const llmAnalysis = await this.llmComms.sendMessage(analysisUserPrompt, analysisSystemPrompt);
 
-            const findingData = { file: targetFile.file, analysis: llmAnalysis, snippet: fileData.content.substring(0, 500), relatedOccurrences: [], cuaContextUsed: !!cuaContextText };
+            const findingData = {
+              file: targetFile.file,
+              analysis: llmAnalysis,
+              snippet: fileData.content.substring(0, 500),
+              relatedOccurrences: [],
+              cuaContextUsed: !!cuaContextText,
+              adviceUsed: relevantAdvice.map(a=>a.adviceId),
+              blameUsed: !!(blameSummary && !blameSummary.includes("Could not retrieve blame")),
+              historyUsed: !!(historySummary && !historySummary.includes("Could not retrieve file history"))
+            };
             this.sharedContext.findings.push({
                 sourceAgent: this.type, type: "PotentialVulnerability",
                 data: findingData,
                 timestamp: new Date()
             });
+
+            this.extractAndStoreSearchablePattern(llmAnalysis, targetFile.file);
 
             const entryUpdate = this.processedItemsHistory[targetFile.file] || { lastAnalyzed: "", analysisTypes: [], contentHash: "" };
             entryUpdate.lastAnalyzed = new Date().toISOString();
@@ -196,37 +230,67 @@ export class ProactiveBugFinder implements SpecializedAgent {
 
     // Heuristic 2: Files in modules marked by CUA as having security risks (from existing insights stored in PBF's sharedContext)
     if (this.sharedContext?.codebaseInsights) {
-        for (const modulePath in this.sharedContext.codebaseInsights) {
-            const insight = this.sharedContext.codebaseInsights[modulePath];
-            if (insight.commonSecurityRisks && insight.commonSecurityRisks.length > 0) {
-                // This logic remains to periodically check already known risky modules from CUA's full context
-                try {
-                    const filesInRiskyModule = await this.chromiumApi.searchCode({
-                        query: "", // No specific content query, just listing files in path
-                        filePattern: `${modulePath}/`,
-                        limit: 10 // Fetch a decent number to filter from
-                    });
-                    for (const searchResult of filesInRiskyModule) {
-                        if (!searchResult.file.match(/\.(cc|h|cpp|js|ts)$/i)) continue; // Client-side filter
+      for (const modulePath in this.sharedContext.codebaseInsights) {
+        const insight = this.sharedContext.codebaseInsights[modulePath];
+        if (insight.commonSecurityRisks && insight.commonSecurityRisks.length > 0) {
+          // Heuristic: Prioritize Key Files identified by CUA within this risky module
+          if (insight.keyFiles && insight.keyFiles.length > 0) {
+            for (const keyFile of insight.keyFiles) {
+              if (!keyFile.filePath.match(/\.(cc|h|cpp|js|ts)$/i)) continue;
 
-                        // Check if already processed by heuristic sweep recently
-                        const entry = this.processedItemsHistory[searchResult.file];
-                        const recentlyCheckedByHeuristic = entry && entry.analysisTypes.includes(this.ANALYSIS_TYPE_HEURISTIC_SWEEP) &&
-                            (new Date().getTime() - new Date(entry.lastAnalyzed).getTime()) < (this.config.recheckIntervalMs || 24 * 3600 * 1000);
-                        if (recentlyCheckedByHeuristic) continue;
+              const entry = this.processedItemsHistory[keyFile.filePath];
+              const recentlyCheckedByHeuristic = entry && entry.analysisTypes.includes(this.ANALYSIS_TYPE_HEURISTIC_SWEEP) &&
+                (new Date().getTime() - new Date(entry.lastAnalyzed).getTime()) < (this.config.recheckIntervalMs || 24 * 3600 * 1000);
+              if (recentlyCheckedByHeuristic) continue;
 
-                        let score = (this.config.prioritizationScore?.cuaRiskMention || 4);
-                        if (this.config.sensitivePathPatterns?.some(p => searchResult.file.includes(p))) {
-                            score += this.config.prioritizationScore?.pathMatch || 5;
-                        }
-                        potentialCandidates.push({
-                            ...searchResult, score,
-                            reason: `File in CUA-identified risky module '${modulePath}'. Risks: ${insight.commonSecurityRisks.join(', ')}. Score: ${score}`
-                        });
-                    }
-                } catch (e) { console.warn(`PBF: Error searching files in CUA risky module ${modulePath}: ${(e as Error).message}`); }
+              let score = this.config.prioritizationScore?.cuaKeyFileInRiskyModule || 6;
+              const churnBonus = (keyFile.recentCommitSummary?.length || 0) * (this.config.prioritizationScore?.cuaKeyFileChurnBonus || 1);
+              score += churnBonus;
+              if (this.config.sensitivePathPatterns?.some(p => keyFile.filePath.includes(p))) {
+                score += this.config.prioritizationScore?.pathMatch || 5;
+              }
+
+              // Create a SearchResult-like object for keyFile
+              const candidateKeyFile: CandidateFile = {
+                file: keyFile.filePath,
+                line: 0, // Not applicable here, or could be line of a primary symbol if available
+                browserUrl: '', // Construct if needed: `https://source.chromium.org/chromium/chromium/src/+/main:${keyFile.filePath}`
+                type: 'cua-keyfile-risky-module',
+                score,
+                reason: `CUA KeyFile in risky module '${modulePath}'. Churn: ${keyFile.recentCommitSummary?.length || 0}. Risks: ${insight.commonSecurityRisks.join(', ')}. Score: ${score}`
+              };
+              potentialCandidates.push(candidateKeyFile);
             }
+          }
+
+          // Fallback: Search for other files in the risky module (existing logic, slightly lower base score)
+          try {
+            const filesInRiskyModule = await this.chromiumApi.searchCode({
+              query: "",
+              filePattern: `${modulePath}/`, // Ensure modulePath ends with / if it's a dir
+              limit: (this.config.maxCandidatesPerHeuristicQuery || 5)
+            });
+            for (const searchResult of filesInRiskyModule) {
+              if (!searchResult.file.match(/\.(cc|h|cpp|js|ts)$/i)) continue;
+              if (potentialCandidates.find(pc => pc.file === searchResult.file)) continue; // Already added as a KeyFile
+
+              const entry = this.processedItemsHistory[searchResult.file];
+              const recentlyCheckedByHeuristic = entry && entry.analysisTypes.includes(this.ANALYSIS_TYPE_HEURISTIC_SWEEP) &&
+                (new Date().getTime() - new Date(entry.lastAnalyzed).getTime()) < (this.config.recheckIntervalMs || 24 * 3600 * 1000);
+              if (recentlyCheckedByHeuristic) continue;
+
+              let score = (this.config.prioritizationScore?.cuaRiskMention || 4); // General file in risky module
+              if (this.config.sensitivePathPatterns?.some(p => searchResult.file.includes(p))) {
+                score += this.config.prioritizationScore?.pathMatch || 5;
+              }
+              potentialCandidates.push({
+                ...searchResult, score,
+                reason: `File in CUA-identified risky module '${modulePath}'. Risks: ${insight.commonSecurityRisks.join(', ')}. Score: ${score}`
+              });
+            }
+          } catch (e) { console.warn(`PBF: Error searching general files in CUA risky module ${modulePath}: ${(e as Error).message}`); }
         }
+      }
     }
 
     // New Heuristic: Reacting to CUA ModuleInsightUpdated Events
@@ -367,12 +431,28 @@ export class ProactiveBugFinder implements SpecializedAgent {
         snippet = contentToAnalyze.substring(0, 500);
       }
 
+      const relevantAdvice = this.getRelevantContextualAdvice(filePath, contentToAnalyze);
+      let adviceTextForPrompt = "";
+      if (relevantAdvice.length > 0) {
+          console.log(`PBF: Found ${relevantAdvice.length} relevant advice items for specific analysis of ${filePath}. Top item: "${relevantAdvice[0].advice.substring(0, 50)}..." (ID: ${relevantAdvice[0].adviceId})`);
+          adviceTextForPrompt = "\n\n--- Relevant Contextual Advice ---\n";
+          relevantAdvice.forEach(advice => {
+              adviceTextForPrompt += `- (${advice.type} from ${advice.sourceAgent}): ${advice.advice}\n`;
+              if (advice.type === ContextualAdviceType.Regex && 'regexPattern' in advice) {
+                    adviceTextForPrompt += `  (Consider if pattern "${(advice as RegexAdvice).regexPattern}" matches anywhere in the code.)\n`;
+              }
+          });
+          adviceTextForPrompt += "--- End Contextual Advice ---\n";
+      }
+
       let cuaContext = "";
       const cua = this.sharedContext.specializedAgents?.get(SpecializedAgentType.CodebaseUnderstanding) as CodebaseUnderstandingAgent | undefined;
       if (cua) {
         try {
           console.log(`PBF: Fetching CUA context for ${filePath} during specific analysis.`);
-          cuaContext = await cua.provideContextForFile(filePath, contentToAnalyze!.substring(0, 500));
+          // Use a smaller snippet for CUA context if full content is large
+          const snippetForCua = contentToAnalyze!.length > 2000 ? contentToAnalyze!.substring(0, 2000) : contentToAnalyze!;
+          cuaContext = await cua.provideContextForFile(filePath, snippetForCua);
           if (cuaContext) {
             cuaContext = `\n\n--- Context from CodebaseUnderstandingAgent ---\n${cuaContext}\n--- End CUA Context ---\n`;
           }
@@ -381,12 +461,24 @@ export class ProactiveBugFinder implements SpecializedAgent {
         }
       }
 
-      const systemPromptForPBF = "You are an expert Chromium security auditor. Your task is to analyze the provided C++ code snippet for potential vulnerabilities. Pay close attention to any module context provided by the CodebaseUnderstandingAgent, as it may highlight relevant risks or technologies."
-      const analysisPrompt = `File to analyze: ${filePath}\n${cuaContext}File content (or relevant part):\n\`\`\`cpp\n${contentToAnalyze!.substring(0,4000)}\n\`\`\`\n\nTask: Identify potential security vulnerabilities in the code snippet above. Consider common C++ pitfalls, IPC issues, memory safety, UAF, race conditions, and web security concerns relevant to Chromium. Rate the severity of each identified issue (Critical, High, Medium, Low). Be concise in your analysis. If you identify a specific risky function call or code pattern that might appear elsewhere, also output it on a new line formatted as: SEARCHABLE_PATTERN: <pattern_to_search_for_globally_in_codesearch>`;
+      const { blameSummary, historySummary } = await this.getExtendedFileContextForLLM(filePath, contentToAnalyze!);
+
+      const systemPromptForPBF = "You are an expert Chromium security auditor. Analyze the provided C++ code for vulnerabilities. Consider context from CodebaseUnderstandingAgent, contextual advice, blame information, and file history. Highlight if any of these were particularly relevant to your findings.";
+      const analysisPrompt = `File: ${filePath}\n${cuaContext}${adviceTextForPrompt}${blameSummary}${historySummary}File content (or relevant part):\n\`\`\`cpp\n${contentToAnalyze!.substring(0,4000)}\n\`\`\`\n\nTask: Identify potential security vulnerabilities. Rate severity (Critical, High, Medium, Low). Be concise. If a specific pattern is risky globally, output: SEARCHABLE_PATTERN: <pattern_to_search_for_globally_in_codesearch>`;
       const analysis = await this.llmComms.sendMessage(analysisPrompt, systemPromptForPBF);
 
-      const findingData = {file:filePath, analysis:analysis, snippet:snippet, cuaContextUsed: !!cuaContext};
+      const findingData = {
+        file:filePath,
+        analysis:analysis,
+        snippet:snippet,
+        cuaContextUsed: !!cuaContext,
+        adviceUsed: relevantAdvice.map(a=>a.adviceId),
+        blameUsed: !!(blameSummary && !blameSummary.includes("Could not retrieve blame")),
+        historyUsed: !!(historySummary && !historySummary.includes("Could not retrieve file history"))
+      };
       this.sharedContext.findings.push({ sourceAgent:this.type, type:"SpecificFileAnalysis", data:findingData, timestamp:new Date() });
+
+      this.extractAndStoreSearchablePattern(analysis, filePath);
 
       if (analysis.toLowerCase().includes("critical") || analysis.toLowerCase().includes("high severity")) {
         const eventId = `evt-pbf-${Date.now()}`;
@@ -452,5 +544,157 @@ export class ProactiveBugFinder implements SpecializedAgent {
       const reqIndex = this.sharedContext.requests.findIndex(r => r.requestId === request.requestId);
       if (reqIndex !== -1) this.sharedContext.requests[reqIndex] = request;
     }
+  }
+
+  private getRelevantContextualAdvice(filePath: string, fileContent?: string): ContextualAdvice[] {
+    if (!this.sharedContext.contextualAdvice || this.sharedContext.contextualAdvice.length === 0) {
+      return [];
+    }
+
+    const advice: ContextualAdvice[] = [];
+
+    for (const currentAdvice of this.sharedContext.contextualAdvice) {
+      try {
+        switch (currentAdvice.type) {
+          case ContextualAdviceType.FilePath:
+            const fpAdvice = currentAdvice as FilePathAdvice;
+            if (fpAdvice.pathPattern.endsWith('/')) { // It's a directory/prefix pattern
+              if (filePath.startsWith(fpAdvice.pathPattern)) {
+                advice.push(fpAdvice);
+              }
+            } else { // It's an exact file path pattern
+              if (filePath === fpAdvice.pathPattern) {
+                advice.push(fpAdvice);
+              }
+            }
+            break;
+          case ContextualAdviceType.Regex:
+            if (fileContent) {
+              const rgxAdvice = currentAdvice as RegexAdvice;
+              try {
+                const regex = new RegExp(rgxAdvice.regexPattern, 'gm'); // global, multiline
+                if (regex.test(fileContent)) {
+                  advice.push(rgxAdvice);
+                }
+              } catch (e) {
+                console.warn(`PBF: Invalid regex pattern in RegexAdvice ${rgxAdvice.adviceId}: "${rgxAdvice.regexPattern}". Error: ${(e as Error).message}`);
+              }
+            }
+            break;
+          case ContextualAdviceType.General:
+            if (fileContent) {
+              const genAdvice = currentAdvice as GeneralAdvice;
+              if (genAdvice.keywords && genAdvice.keywords.some(kw => fileContent.toLowerCase().includes(kw.toLowerCase()))) {
+                advice.push(genAdvice);
+              } else if (!genAdvice.keywords) { // If no keywords, it's general advice to always consider (maybe too broad)
+                // For now, only add general advice if keywords match.
+              }
+            }
+            break;
+        }
+      } catch (e) {
+        console.warn(`PBF: Error applying contextual advice ${currentAdvice.adviceId} to ${filePath}: ${(e as Error).message}`);
+      }
+    }
+    // Sort by priority (descending) then by date (newest first)
+    advice.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return advice.slice(0, 5); // Return top 5 relevant advice items
+  }
+
+  private extractAndStoreSearchablePattern(llmAnalysis: string, sourceFilePath: string): void {
+    const lines = llmAnalysis.split('\n');
+    const patternPrefix = "SEARCHABLE_PATTERN:";
+    for (const line of lines) {
+      if (line.trim().startsWith(patternPrefix)) {
+        const extractedPattern = line.trim().substring(patternPrefix.length).trim();
+        if (extractedPattern) {
+          console.log(`PBF: Extracted searchable pattern: "${extractedPattern}" from analysis of ${sourceFilePath}`);
+          const newAdvice: RegexAdvice = {
+            adviceId: `pbf-selfgen-${Date.now()}-${computeSha256Hash(extractedPattern).substring(0,8)}`,
+            sourceAgent: this.type,
+            type: ContextualAdviceType.Regex,
+            regexPattern: extractedPattern, // Assuming LLM provides a valid regex string or a string to be used as literal search
+            advice: `Previously identified potentially risky pattern by PBF during analysis of ${sourceFilePath}: '${extractedPattern}'. Verify if this new instance is also problematic or shares characteristics.`,
+            description: `Self-generated pattern from PBF analysis of ${sourceFilePath}`,
+            priority: 7, // Fairly high priority for self-discovered patterns
+            createdAt: new Date().toISOString(),
+          };
+          if (!this.sharedContext.contextualAdvice) this.sharedContext.contextualAdvice = [];
+
+          // Avoid adding duplicate patterns from the same source file analysis if PBF somehow outputs many
+          const alreadyExists = this.sharedContext.contextualAdvice.some(
+            adv => adv.type === ContextualAdviceType.Regex &&
+                   (adv as RegexAdvice).regexPattern === extractedPattern &&
+                   adv.description?.includes(sourceFilePath) && // simple check
+                   adv.sourceAgent === this.type
+          );
+
+          if (!alreadyExists) {
+            this.sharedContext.contextualAdvice.push(newAdvice);
+            console.log(`PBF: Added new self-generated RegexAdvice: ${newAdvice.adviceId}`);
+          } else {
+            console.log(`PBF: Self-generated pattern "${extractedPattern}" from ${sourceFilePath} likely already added.`);
+          }
+          // Only take the first one for now to avoid too much noise from one analysis
+          break;
+        }
+      }
+    }
+  }
+
+  private async getExtendedFileContextForLLM(filePath: string, fileContent: string): Promise<{blameSummary: string, historySummary: string}> {
+    let blameSummary = "";
+    let historySummary = "";
+
+    // 1. Get Blame for suspicious lines (simplified: for now, just first few lines with "UNSAFE", "TODO", "XXX")
+    try {
+      const maxBlameLines = this.config.maxBlameContextLinesForLLM || 2;
+      const suspiciousLineNumbers: number[] = [];
+      const lines = fileContent.split('\n');
+      const criticalKeywords = ["UNSAFE", "reinterpret_cast", "TODO", "XXX", "DCHECK", "NOTREACHED"]; // Example keywords
+
+      for (let i = 0; i < lines.length && suspiciousLineNumbers.length < maxBlameLines * 5; i++) { // Scan more lines initially
+        if (criticalKeywords.some(kw => lines[i].toUpperCase().includes(kw))) {
+          suspiciousLineNumbers.push(i + 1); // Line numbers are 1-based
+        }
+      }
+
+      if (suspiciousLineNumbers.length > 0) {
+        const blameInfo = await this.chromiumApi.getBlame(filePath);
+        if (blameInfo && blameInfo.length > 0) {
+          blameSummary = "\n\n--- Blame Information (for potentially relevant lines) ---\n";
+          let addedBlameCount = 0;
+          for (const lineNum of suspiciousLineNumbers) {
+            if (addedBlameCount >= maxBlameLines) break;
+            const lineBlame = blameInfo.find(b => b.line === lineNum);
+            if (lineBlame) {
+              blameSummary += `Line ${lineBlame.line} (Commit: ${lineBlame.rev.substring(0,7)}, Author: ${lineBlame.author}, Date: ${lineBlame.date}): ${lineBlame.content.trim()}\n`;
+              addedBlameCount++;
+            }
+          }
+          blameSummary += "--- End Blame Information ---\n";
+        }
+      }
+    } catch (e) {
+      console.warn(`PBF: Error getting blame info for ${filePath}: ${(e as Error).message}`);
+      blameSummary = "\n\n(Could not retrieve blame information)\n";
+    }
+
+    // 2. Get File Commit History
+    try {
+      const maxHistoryCommits = this.config.maxFileHistoryCommitsForLLM || 3;
+      const historyData = await this.chromiumApi.searchCommits({ query: `path:${filePath}`, limit: maxHistoryCommits });
+      if (historyData && historyData.log && historyData.log.length > 0) {
+        historySummary = "\n\n--- Recent File History ---\n";
+        historyData.log.forEach(commit => {
+          historySummary += `- ${commit.commit.substring(0,7)}: ${commit.message.split('\n')[0].substring(0, 70)}... (Author: ${commit.author?.email}, Date: ${commit.author?.time})\n`;
+        });
+        historySummary += "--- End Recent File History ---\n";
+      }
+    } catch (e) {
+      console.warn(`PBF: Error getting file history for ${filePath}: ${(e as Error).message}`);
+      historySummary = "\n\n(Could not retrieve file history)\n";
+    }
+    return { blameSummary, historySummary };
   }
 }

@@ -19,6 +19,10 @@ export interface ProactiveBugFinderConfig {
     keywordInFile: number;
     recentClMention: number;
     sensitivePathRecentCommitScore?: number;
+    cuaRiskMention?: number; // Score for being in a CUA-identified risky module (general file)
+    knownPatternMatch?: number; // Score for matching a known bug pattern via RegexAdvice
+    cuaKeyFileInRiskyModule?: number; // Higher score for being a CUA-identified KeyFile in a risky module
+    cuaKeyFileChurnBonus?: number; // Bonus per recent commit for a CUA KeyFile
   };
   maxProcessedFileHistory?: number; // Max number of file paths to remember
   heuristicScanIntervalMinutes?: number; // Interval for heuristic scans (less relevant now)
@@ -27,6 +31,9 @@ export interface ProactiveBugFinderConfig {
   interItemDelayMs?: number; // Small delay between processing items in the loop
   maxCandidatesPerHeuristicQuery?: number; // Max candidates to fetch in one heuristic check
   recheckIntervalMs?: number; // How long before a heuristically found file might be checked again
+  maxBlameContextLinesForLLM?: number; // Max suspicious lines to get blame info for to include in LLM prompt
+  maxFileHistoryCommitsForLLM?: number; // Max recent commits to summarize for file history for LLM prompt
+  maxContextualAdviceItemsPerAgentPBF?: number; // Max contextual advice items PBF will store (self-generated)
 }
 
 export interface BugPatternAnalysisConfig {
@@ -42,6 +49,8 @@ export interface BugPatternAnalysisConfig {
   maxIssuePagesToScanPerCycle?: number; // Max issue pages to scan before resetting pagination
   // maxCommitPagesToScanPerCycle is removed as commit pagination is simplified
   resetPaginationAfterIdleMinutes?: number; // After minutes of full idle, reset pagination (conceptual for now)
+  maxContextualAdviceItemsPerAgentBPA?: number; // Max contextual advice items this agent will store
+  maxDiffSummaryCharsForLLM?: number; // Max characters of a commit diff to include in LLM prompt
 }
 
 export interface CodebaseUnderstandingConfig {
@@ -54,6 +63,8 @@ export interface CodebaseUnderstandingConfig {
   itemProcessingCheckIntervalMsCUA?: number; // How often to check if current item is done for CUA
   interItemDelayMsCUA?: number; // Small delay between processing items in CUA loop
   exampleModulesForCUA?: string[]; // Example modules CUA might cycle through
+  maxContextualAdviceItemsPerAgentCUA?: number; // Max contextual advice items this agent will store
+  maxCommitsForKeyFileHistoryCUA?: number; // Max commits to fetch for a key file's history
 }
 
 export interface GenericTaskAgentConfig {
@@ -88,6 +99,10 @@ const DEFAULT_AGENT_CONFIG: AgentConfig = {
       keywordInFile: 3,
       recentClMention: 2,
       sensitivePathRecentCommitScore: 7,
+      cuaRiskMention: 4, // Default score
+      knownPatternMatch: 5, // Default score
+      cuaKeyFileInRiskyModule: 6, // Default higher score
+      cuaKeyFileChurnBonus: 1, // Default bonus per commit
     },
     maxProcessedFileHistory: 200, // Increased history
     heuristicScanIntervalMinutes: 5, // Kept for status, but loop is continuous
@@ -96,6 +111,9 @@ const DEFAULT_AGENT_CONFIG: AgentConfig = {
     interItemDelayMs: 200, // 0.2 seconds between items
     maxCandidatesPerHeuristicQuery: 5, // Fetch 5 potential candidates in one heuristic check
     recheckIntervalMs: 7 * 24 * 3600 * 1000, // Re-check a file heuristically after 7 days
+    maxBlameContextLinesForLLM: 3, // Default max lines to get blame for
+    maxFileHistoryCommitsForLLM: 3, // Default max commits for file history
+    maxContextualAdviceItemsPerAgentPBF: 20, // Default PBF self-generated advice limit
   },
   bugPatternAnalysis: {
     commitsPerCycle: 1, // Processes one commit at a time in its new loop
@@ -110,6 +128,8 @@ const DEFAULT_AGENT_CONFIG: AgentConfig = {
     maxIssuePagesToScanPerCycle: 10, // Default: scan up to 10 pages of issues before reset
     // maxCommitPagesToScanPerCycle: 5, // Removed
     resetPaginationAfterIdleMinutes: 60, // Default: reset pagination if idle for 60 mins (conceptual)
+    maxContextualAdviceItemsPerAgentBPA: 30, // Default for BPA advice items
+    maxDiffSummaryCharsForLLM: 750, // Default max chars for diff summary in prompt
   },
   codebaseUnderstanding: {
     filesPerModuleCycle: 3, // During a specific module's deep dive (still relevant for performSingleModuleAnalysis)
@@ -128,7 +148,9 @@ const DEFAULT_AGENT_CONFIG: AgentConfig = {
         "third_party/blink/renderer/core/editing",
         "net/disk_cache",
         "media/gpu"
-    ]
+    ],
+    maxContextualAdviceItemsPerAgentCUA: 50, // Default value for max contextual advice items
+    maxCommitsForKeyFileHistoryCUA: 3 // Default for key file commit history
   }
 };
 
