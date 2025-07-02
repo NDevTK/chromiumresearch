@@ -217,7 +217,7 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
 
   private async selectNextCommitForAnalysis(): Promise<any | undefined> {
     const commitsToFetch = this.config.commitsPerCycle || 1; // This now acts as a simple limit.
-    const query = 'fix security OR cve- OR vulnerability OR exploit OR rce OR xss OR uaf';
+    const query = 'security OR cve- OR vulnerability OR exploit OR rce OR xss OR uaf';
 
     try {
       // Fetch the most recent N commits matching the criteria.
@@ -259,7 +259,7 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
     if (this.config.targetIssueSeverities?.length) {
       query += ` (${this.config.targetIssueSeverities.map(s => `severity:"${s}"`).join(" OR ")})`; // Added quotes for severity
     } else {
-      query += ` (security OR vulnerability)`;
+      query += ``;
     }
 
     // Max pages to scan in one full sweep before resetting.
