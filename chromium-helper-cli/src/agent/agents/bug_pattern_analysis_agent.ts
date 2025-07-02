@@ -8,8 +8,13 @@ import {
     SpecializedAgentType,
     SharedAgentContextType,
     ProcessedItemsHistory,
-    BugPattern // Import BugPattern if it's used directly by type hints
+    BugPattern,
+    ContextualAdvice,
+    ContextualAdviceType,
+    RegexAdvice,
+    GeneralAdvice
 } from './types.js'; // Import from new types.ts
+import { escapeRegExp } from '../../agent_utils.js';
 
 export class BugPatternAnalysisAgent implements SpecializedAgent {
   public type = SpecializedAgentType.BugPatternAnalysis;
@@ -25,6 +30,7 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
   private isIssueScanning: boolean = false; // For issue scanning
   private lastPatternExtraction?: Date;
   private lastIssueScan?: Date;
+  private lastCommitKeywordIndex: number = 0; // For iterating through commit search keywords
 
   // Pagination state for issues
   private currentIssueStartIndex: number = 0;
@@ -35,6 +41,7 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
   // private patternExtractionIntervalId?: NodeJS.Timeout; // Not used
   // private issueAnalysisIntervalId?: NodeJS.Timeout; // Not used
 
+  private readonly COMMIT_SEARCH_KEYWORDS = ['security', 'cve', 'vulnerability', 'exploit', 'rce', 'xss', 'uaf', 'asan', 'msan', 'tsan', 'ubsan', 'sandbox', 'permissions'];
 
   private readonly ANALYSIS_TYPE_COMMIT = "bpa_commit_analysis";
   private readonly ANALYSIS_TYPE_ISSUE = "bpa_issue_analysis";
@@ -46,7 +53,11 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
     this.storage = new PersistentStorage('BugPatternAnalysis_data');
     this.setSharedContext(sharedContext); console.log("Bug Pattern Analysis agent initialized."); this.loadState();
   }
-  public setSharedContext(context: SharedAgentContextType): void { this.sharedContext = context; if(!this.sharedContext.knownBugPatterns) this.sharedContext.knownBugPatterns = []; }
+  public setSharedContext(context: SharedAgentContextType): void {
+    this.sharedContext = context;
+    if(!this.sharedContext.knownBugPatterns) this.sharedContext.knownBugPatterns = [];
+    if(!this.sharedContext.contextualAdvice) this.sharedContext.contextualAdvice = [];
+  }
 
   private async loadState(): Promise<void> {
     const state = await this.storage.loadData<{
@@ -54,12 +65,10 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
         lastIssueScan?: string;
         patterns?: Array<BugPattern|string>;
         patternIdCounter?: number;
-        patterns?: Array<BugPattern|string>;
-        patternIdCounter?: number;
         processedItemsHistory?: ProcessedItemsHistory;
         currentIssueStartIndex?: number;
         totalIssuesDiscoveredInLastFullScan?: number;
-        // currentCommitStartToken and commitsScannedInCurrentFullSweep are removed
+        contextualAdviceBPA?: ContextualAdvice[]; // Added for BPA specific advice
     }>();
     if (state) {
       if (state.lastExtraction) this.lastPatternExtraction = new Date(state.lastExtraction);
@@ -71,16 +80,26 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
       this.totalIssuesDiscoveredInLastFullScan = state.totalIssuesDiscoveredInLastFullScan || 0;
 
       // Legacy migration for old processedCommitIds/processedIssueIds
-      if (!state.processedItemsHistory && (state.processedCommitIds || state.processedIssueIds)) {
+      if (!state.processedItemsHistory && ((state as any).processedCommitIds || (state as any).processedIssueIds)) {
         const now = new Date().toISOString();
-        if (state.processedCommitIds && Array.isArray(state.processedCommitIds)) {
-          state.processedCommitIds.forEach((id: string) => { this.processedItemsHistory[id] = { lastAnalyzed: now, analysisTypes: [this.ANALYSIS_TYPE_COMMIT + "_legacy"]}; });
+        if ((state as any).processedCommitIds && Array.isArray((state as any).processedCommitIds)) {
+          (state as any).processedCommitIds.forEach((id: string) => { this.processedItemsHistory[id] = { lastAnalyzed: now, analysisTypes: [this.ANALYSIS_TYPE_COMMIT + "_legacy"]}; });
         }
-        if (state.processedIssueIds && Array.isArray(state.processedIssueIds)) {
-          state.processedIssueIds.forEach((id: string) => { this.processedItemsHistory[id] = { lastAnalyzed: now, analysisTypes: [this.ANALYSIS_TYPE_ISSUE + "_legacy"]}; });
+        if ((state as any).processedIssueIds && Array.isArray((state as any).processedIssueIds)) {
+          (state as any).processedIssueIds.forEach((id: string) => { this.processedItemsHistory[id] = { lastAnalyzed: now, analysisTypes: [this.ANALYSIS_TYPE_ISSUE + "_legacy"]}; });
         }
       }
-      console.log(`BPA: Loaded ${Object.keys(this.processedItemsHistory).length} items into history. Issue Start Index: ${this.currentIssueStartIndex}.`);
+
+      // Load and merge contextual advice for BPA
+      const loadedAdvice = state.contextualAdviceBPA || [];
+      const existingAdviceIds = new Set(this.sharedContext.contextualAdvice?.map(a => a.adviceId) || []);
+      loadedAdvice.forEach(advice => {
+        if (!existingAdviceIds.has(advice.adviceId)) {
+          this.sharedContext.contextualAdvice?.push(advice);
+          existingAdviceIds.add(advice.adviceId);
+        }
+      });
+      console.log(`BPA: Loaded ${Object.keys(this.processedItemsHistory).length} items into history. Issue Start Index: ${this.currentIssueStartIndex}. Loaded ${loadedAdvice.length} BPA-specific contextual advice items.`);
     }
   }
   private async saveState(): Promise<void> {
@@ -89,6 +108,10 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
       const sorted = keys.sort((a,b) => new Date(this.processedItemsHistory[a].lastAnalyzed).getTime() - new Date(this.processedItemsHistory[b].lastAnalyzed).getTime());
       for(let i=0; i < keys.length - maxItems; i++) delete this.processedItemsHistory[sorted[i]];
     }
+
+    // Filter and save only BPA-generated advice
+    const bpaGeneratedAdvice = this.sharedContext.contextualAdvice?.filter(a => a.sourceAgent === this.type) || [];
+
     await this.storage.saveData({
         lastExtraction: this.lastPatternExtraction?.toISOString(),
         lastIssueScan: this.lastIssueScan?.toISOString(),
@@ -96,9 +119,10 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
         patternIdCounter: this.patternIdCounter,
         processedItemsHistory: this.processedItemsHistory,
         currentIssueStartIndex: this.currentIssueStartIndex,
-        totalIssuesDiscoveredInLastFullScan: this.totalIssuesDiscoveredInLastFullScan
-        // currentCommitStartToken and commitsScannedInCurrentFullSweep are removed
+        totalIssuesDiscoveredInLastFullScan: this.totalIssuesDiscoveredInLastFullScan,
+        contextualAdviceBPA: bpaGeneratedAdvice
     });
+    console.log(`BPA: Saved state. BPA-specific advice items saved: ${bpaGeneratedAdvice.length}`);
   }
 
   public async start(): Promise<void> {
@@ -216,20 +240,20 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
   }
 
   private async selectNextCommitForAnalysis(): Promise<any | undefined> {
-    const commitsToFetch = this.config.commitsPerCycle || 1; // This now acts as a simple limit.
-    const query = 'security OR cve- OR vulnerability OR exploit OR rce OR xss OR uaf';
+    const commitsToFetch = this.config.commitsPerCycle || 1;
+
+    // Cycle through keywords for broader search over time
+    const keyword = this.COMMIT_SEARCH_KEYWORDS[this.lastCommitKeywordIndex];
+    this.lastCommitKeywordIndex = (this.lastCommitKeywordIndex + 1) % this.COMMIT_SEARCH_KEYWORDS.length;
 
     try {
-      // Fetch the most recent N commits matching the criteria.
-      // The ChromiumAPI.searchCommits has been reverted and no longer takes startCommit or returns nextCommitToken.
-      // It will internally filter by query if the API doesn't support it directly for +log.
-      console.log(`BPA: Selecting next commit. Query: "${query}", Limit: ${commitsToFetch}`);
+      console.log(`BPA: Selecting next commit. Query keyword: "${keyword}", Limit: ${commitsToFetch}`);
       const searchResults = await this.chromiumApi.searchCommits({
-        query: query,
-        limit: commitsToFetch * 2 // Fetch a bit more to increase chances of finding an unprocessed one
+        query: keyword, // Use single keyword
+        limit: commitsToFetch * 3 // Fetch a bit more to increase chances of finding an unprocessed one with a single term
       });
 
-      const fetchedCommits = searchResults.log || []; // Assuming searchCommits returns { log: CommitLogEntry[] }
+      const fetchedCommits = searchResults.log || [];
 
       // Filter out already processed commits
       const newCommits = fetchedCommits.filter(commit => {
@@ -358,19 +382,53 @@ export class BugPatternAnalysisAgent implements SpecializedAgent {
   }
 
   private async analyzeCommit(commit: any): Promise<void> {
-    const id = commit.commit;
+    const commitHash = commit.commit;
+    if (!commitHash) {
+      console.warn("BPA: analyzeCommit called with no commit hash.");
+      return;
+    }
+
     try {
-      let clComments = "";
+      const detailedCommit = await this.chromiumApi.getCommitDetails(commitHash);
+      const diffText = await this.chromiumApi.getCommitDiff(commitHash);
+
+      let clComments = ""; // Placeholder for actual CL comments if fetched separately
+      let diffSummaryForPrompt = "";
+      let changedFilesSummary = "";
+
+      if (diffText) {
+        const maxDiffChars = this.config.maxDiffSummaryCharsForLLM || 750;
+        diffSummaryForPrompt = "\n\nCommit Diff (summary):\n---\n";
+        if (diffText.length < maxDiffChars) {
+          diffSummaryForPrompt += diffText;
+        } else {
+          diffSummaryForPrompt += diffText.substring(0, maxDiffChars) + "\n... (diff truncated) ...";
+        }
+        diffSummaryForPrompt += "\n---";
+      }
+
+      if (detailedCommit.tree_diff && detailedCommit.tree_diff.length > 0) {
+        changedFilesSummary = "\n\nFiles changed in this commit:\n";
+        detailedCommit.tree_diff.slice(0, 10).forEach(fileEntry => { // Limit to 10 files for summary
+          changedFilesSummary += `- ${fileEntry.filename} (${fileEntry.status}, +${fileEntry.additions || 0}/-${fileEntry.deletions || 0})\n`;
+        });
+        if (detailedCommit.tree_diff.length > 10) {
+          changedFilesSummary += "... (and more files)\n";
+        }
+      } else if (commit.files && commit.files.length > 0) { // Fallback to files from searchCommits if tree_diff is empty
+         changedFilesSummary = `\n\nFiles changed (from commit log): ${commit.files.slice(0, 5).join(', ')}${commit.files.length > 5 ? ', ...' : ''}`;
+      }
+
       const systemPrompt = `You are an expert security analyst. Extract information to populate a BugPattern JSON object.
 The BugPattern structure is: { id: string, name: string, description: string, cwe?: string, tags: string[], exampleGoodPractice?: string, exampleVulnerableCode?: string, source?: string, confidence?: 'High'|'Medium'|'Low', severity?: 'Critical'|'High'|'Medium'|'Low'|'Info' }
-Focus on the main vulnerability described or fixed. Be concise. The 'name' should be a short title for the bug type.
+Focus on the main vulnerability described or fixed, using the full commit message, list of changed files (with stats), and diff summary. Be concise. The 'name' should be a short title for the bug type.
 'description' should explain the pattern. 'tags' can include terms like 'UAF', 'IPC', 'RaceCondition', etc.
 'source' will be pre-filled. Output ONLY the JSON object.`;
-      const userPrompt = `Analyze the following commit message and extract a concise BugPattern JSON object.
-Commit Message:
+      const userPrompt = `Analyze the following commit data and extract a concise BugPattern JSON object.
+Full Commit Message:
 ---
-${commit.message.substring(0, 2000)}
----
+${detailedCommit.message.substring(0, 3000)}
+---${changedFilesSummary}${diffSummaryForPrompt}
 ${clComments}
 Extract the BugPattern JSON:`;
 
@@ -396,12 +454,51 @@ Extract the BugPattern JSON:`;
             data: { patternId: nP.id, name: nP.name, source: nP.source, description: nP.description.substring(0,100)+"..." },
             timestamp: new Date()
         });
+        this.generateAndStoreContextualAdviceForPattern(nP);
       }
-      const entry = this.processedItemsHistory[id] || { lastAnalyzed: "", analysisTypes: [] };
+      const entry = this.processedItemsHistory[commitHash] || { lastAnalyzed: "", analysisTypes: [] };
       entry.lastAnalyzed = new Date().toISOString();
       if (!entry.analysisTypes.includes(this.ANALYSIS_TYPE_COMMIT)) entry.analysisTypes.push(this.ANALYSIS_TYPE_COMMIT);
-      this.processedItemsHistory[id] = entry;
-    } catch (e) { console.error(`BPA: Error processing commit ${id}`, e); }
+      this.processedItemsHistory[commitHash] = entry;
+
+      // Step 4: Generate commit-derived general advice
+      try {
+        const adviceSystemPrompt = `You are a security expert reviewing a commit that fixed a known bug pattern. Your goal is to provide a single piece of concise, actionable security advice for developers reviewing similar code or components in the future. Focus on preventative measures or specific areas to scrutinize based on the bug type and the context of the fix. Output only the single piece of advice as a string.`;
+        const topChangedFiles = detailedCommit.tree_diff?.slice(0,3).map(f => f.filename).join(', ') || "N/A";
+        const adviceUserPrompt = `A commit fixed a '${nP.name}' vulnerability (tags: ${nP.tags?.join(', ') || 'N/A'}).
+Commit Message Snippet:
+---
+${detailedCommit.message.substring(0, 1000)}...
+---
+Key files changed included: ${topChangedFiles}
+
+Based on this, provide one concise piece of actionable security advice (1-2 sentences) for developers working on similar code/components:`;
+
+        const generatedAdviceString = await this.llmComms.sendMessage(adviceUserPrompt, adviceSystemPrompt);
+
+        if (generatedAdviceString && generatedAdviceString.length > 10) { // Basic check for non-empty response
+          const commitDerivedAdvice: GeneralAdvice = {
+            adviceId: `bpa-cmgen-${nP.id.substring(0,10)}-${Date.now()}`,
+            sourceAgent: this.type,
+            type: ContextualAdviceType.General,
+            advice: generatedAdviceString.trim(),
+            description: `General advice derived from commit ${commitHash.substring(0,7)} which fixed a ${nP.name}.`,
+            keywords: [
+                ...(nP.tags || []),
+                ...(detailedCommit.tree_diff?.slice(0,1).map(f => f.filename.split('/').pop()?.replace(/\.\w+$/, "") || "") || []) // First changed filename without extension
+            ].filter(kw => kw), // Remove empty keywords
+            priority: 6,
+            createdAt: new Date().toISOString(),
+            // source: `commit:${commitHash}` // Already part of description
+          };
+          this.sharedContext.contextualAdvice?.push(commitDerivedAdvice);
+          console.log(`BPA: Generated commit-derived general advice for pattern ${nP.name} from commit ${commitHash.substring(0,7)}.`);
+        }
+      } catch(adviceError) {
+        console.warn(`BPA: Failed to generate commit-derived advice for ${commitHash}: ${(adviceError as Error).message}`);
+      }
+
+    } catch (e) { console.error(`BPA: Error processing commit ${commitHash}`, e); }
   }
 
   private async analyzeIssue(issue: any): Promise<void> {
@@ -412,18 +509,108 @@ Extract the BugPattern JSON:`;
         this.processedItemsHistory[id] = { lastAnalyzed: new Date().toISOString(), analysisTypes: [this.ANALYSIS_TYPE_ISSUE] };
         return;
       }
-      let commentsText = "";
+
+      let associatedCommitInfo = "";
+      let primaryCommitHashToFetch: string | null = null;
+
+      // Prefer structured relatedCLs if available
+      if (details.relatedCLs && details.relatedCLs.length > 0) {
+        // Assuming relatedCLs might contain full commit hashes or CL numbers.
+        // For now, we'll try the first one, assuming it's a hash or CL that getCommitDetails can handle.
+        // A more robust solution would parse these to ensure they are valid hashes.
+        const firstRelatedCl = details.relatedCLs[0];
+        if (typeof firstRelatedCl === 'string' && /^[a-f0-9]{7,40}$/i.test(firstRelatedCl)) { // Check if it looks like a hash
+             primaryCommitHashToFetch = firstRelatedCl;
+             console.log(`BPA: Using first relatedCL ${primaryCommitHashToFetch} from issue ${id}.`);
+        } else if (typeof firstRelatedCl === 'string' && /^\d+$/.test(firstRelatedCl)) { // Check if it looks like a CL number
+            console.log(`BPA: Found CL number ${firstRelatedCl} in relatedCLs for issue ${id}. Attempting to use it with getCommitDetails.`);
+            primaryCommitHashToFetch = firstRelatedCl; // Assume getCommitDetails might handle CL numbers
+        } else {
+            console.log(`BPA: First relatedCL '${firstRelatedCl}' for issue ${id} is not a recognized hash or CL number format. Falling back to regex search.`);
+        }
+      }
+
+      if (!primaryCommitHashToFetch) {
+        const textToSearchCommits = details.description + (details.comments?.map(c => c.content).join('\n') || '');
+        const commitHashRegex = /\b([a-f0-9]{40})\b/gi;
+        const crDashCommitRegex = /chromiumdash\.appspot\.com\/commit\/([a-f0-9]{40})/gi;
+        // Gerrit CL regex is less useful here if we can't resolve CL# to hash easily via API.
+        // const gerritClRegex = /chromium-review\.googlesource\.com\/c\/chromium\/src\/\+\/(\d+)/gi;
+
+        let match;
+        if ((match = commitHashRegex.exec(textToSearchCommits)) !== null) {
+          primaryCommitHashToFetch = match[1];
+        } else if ((match = crDashCommitRegex.exec(textToSearchCommits)) !== null) {
+          primaryCommitHashToFetch = match[1];
+        }
+        if (primaryCommitHashToFetch) {
+            console.log(`BPA: Found commit hash ${primaryCommitHashToFetch} via regex in issue ${id}.`);
+        }
+      }
+
+      if (primaryCommitHashToFetch) {
+        try {
+          console.log(`BPA: Fetching details for commit ${primaryCommitHashToFetch} linked to issue ${id}.`);
+          const commitDetails = await this.chromiumApi.getCommitDetails(primaryCommitHashToFetch);
+          const commitDiffText = await this.chromiumApi.getCommitDiff(primaryCommitHashToFetch);
+
+          associatedCommitInfo = "\n\n--- Associated Commit Details ---\n";
+          associatedCommitInfo += `Commit: ${commitDetails.commit}\n`;
+          associatedCommitInfo += `Message: ${commitDetails.message.substring(0, 1000)}...\n`; // Increased message length
+
+          if (commitDetails.tree_diff && commitDetails.tree_diff.length > 0) {
+            associatedCommitInfo += "Files changed:\n";
+            commitDetails.tree_diff.slice(0, 5).forEach(fileEntry => {
+              associatedCommitInfo += `  - ${fileEntry.filename} (${fileEntry.status}, +${fileEntry.additions || 0}/-${fileEntry.deletions || 0})\n`;
+            });
+            if (commitDetails.tree_diff.length > 5) associatedCommitInfo += "  ... (and more files)\n";
+          }
+
+          if (commitDiffText) {
+            const maxDiffChars = this.config.maxDiffSummaryCharsForLLM || 500;
+            associatedCommitInfo += "\nDiff Summary:\n";
+            if (commitDiffText.length < maxDiffChars) {
+              associatedCommitInfo += commitDiffText;
+            } else {
+              associatedCommitInfo += commitDiffText.substring(0, maxDiffChars) + "\n... (diff truncated) ...";
+            }
+          }
+          associatedCommitInfo += "\n--- End Associated Commit Details ---";
+        } catch (e) {
+          console.warn(`BPA: Failed to get details for commit ${primaryCommitHashToFetch} linked to issue ${id}: ${(e as Error).message}`);
+          associatedCommitInfo = `\n\n(Could not fetch details for potential commit ${primaryCommitHashToFetch})\n`;
+        }
+      }
+
+      // Summarize key comments (optional enhancement)
+      let keyCommentsSummary = "";
+      if (details.comments && details.comments.length > 0) {
+        const securityKeywords = ["vulnerability", "exploit", "root cause", "security impact", "uaf", "heap overflow"];
+        const relevantComments = details.comments.filter(comment =>
+            securityKeywords.some(kw => comment.content.toLowerCase().includes(kw))
+        ).slice(0, 2); // Take top 2 relevant comments
+
+        if (relevantComments.length > 0) {
+            keyCommentsSummary = "\n\n--- Key Issue Comments ---\n";
+            relevantComments.forEach(comment => {
+                keyCommentsSummary += `Comment by ${comment.author} (${comment.timestamp}):\n${comment.content.substring(0, 300)}...\n---\n`;
+            });
+            keyCommentsSummary += "--- End Key Issue Comments ---\n";
+        }
+      }
+
+      let commentsText = ""; // Main commentsText for prompt (currently empty, but structure is there)
       const systemPrompt = `You are an expert security analyst. Extract information to populate a BugPattern JSON object.
 The BugPattern structure is: { id: string, name: string, description: string, cwe?: string, tags: string[], exampleGoodPractice?: string, exampleVulnerableCode?: string, source?: string, confidence?: 'High'|'Medium'|'Low', severity?: 'Critical'|'High'|'Medium'|'Low'|'Info' }
-Focus on the main vulnerability described. Be concise. The 'name' should be a short title for the bug type.
+Focus on the main vulnerability described in the issue. If associated commit data is provided, use it to refine the pattern. Be concise. The 'name' should be a short title for the bug type.
 'description' should explain the pattern. 'tags' can include terms like 'UAF', 'IPC', 'RaceCondition', etc.
 'source' will be pre-filled. Output ONLY the JSON object.`;
-      const userPrompt = `Analyze the following issue details and extract a concise BugPattern JSON object.
+      const userPrompt = `Analyze the following issue details (and associated commit if found, and key comments) and extract a concise BugPattern JSON object.
 Issue Title: ${details.title}
 Issue Description (first 1000 chars):
 ---
 ${details.description.substring(0, 1000)}
----
+---${associatedCommitInfo}${keyCommentsSummary}
 ${commentsText}
 Extract the BugPattern JSON:`;
 
@@ -449,12 +636,118 @@ Extract the BugPattern JSON:`;
             data: { patternId: nP.id, name: nP.name, source: nP.source, description: nP.description.substring(0,100)+"..." },
             timestamp: new Date()
         });
+        this.generateAndStoreContextualAdviceForPattern(nP);
       }
       const entry = this.processedItemsHistory[id] || { lastAnalyzed: "", analysisTypes: [] };
       entry.lastAnalyzed = new Date().toISOString();
       if (!entry.analysisTypes.includes(this.ANALYSIS_TYPE_ISSUE)) entry.analysisTypes.push(this.ANALYSIS_TYPE_ISSUE);
       this.processedItemsHistory[id] = entry;
     } catch (e) { console.error(`BPA: Error processing issue ${id}`, e); }
+  }
+
+  private async generateAndStoreContextualAdviceForPattern(pattern: BugPattern): Promise<void> { // Made async
+    if (!this.sharedContext.contextualAdvice) {
+      this.sharedContext.contextualAdvice = [];
+    }
+
+    // New: Try to search for exact code snippet from exampleVulnerableCode
+    if (pattern.exampleVulnerableCode) {
+      const snippet = pattern.exampleVulnerableCode;
+      // Basic suitability check for direct search (e.g., not too long, not too short)
+      if (snippet.length > 10 && snippet.length < 150 && !snippet.includes('\n')) { // Single, reasonably sized line
+        try {
+          console.log(`BPA: Searching for exact snippet from pattern ${pattern.name}: "${snippet.substring(0,50)}..."`);
+          const searchResults = await this.chromiumApi.searchCode({ query: `"${snippet}"`, limit: 5 }); // Exact phrase search
+
+          if (searchResults.length > 0) {
+            // Check if any result is outside what might be the source of the example itself (heuristic)
+            // This is hard to do perfectly without knowing the source file of the pattern example.
+            // For now, if we find any matches, we'll assume they are relevant additional locations.
+            const locations = searchResults.map(r => `${r.file}:${r.line}`).slice(0,3);
+            const exactMatchAdvice: RegexAdvice = {
+              adviceId: `bpa-exactmatch-${pattern.id}-${Date.now()}`,
+              sourceAgent: this.type,
+              type: ContextualAdviceType.Regex,
+              regexPattern: escapeRegExp(snippet), // Use the snippet itself as a regex pattern
+              advice: `Pattern '${pattern.name}' (Severity: ${pattern.severity || 'N/A'}). An exact code snippet matching its vulnerable example ('${snippet.substring(0,50)}...') was found in locations like: ${locations.join(', ')}. These should be reviewed.`,
+              description: `Exact code snippet match for pattern: ${pattern.name}`,
+              priority: 8, // High priority for exact matches
+              createdAt: new Date().toISOString(),
+            };
+            this.sharedContext.contextualAdvice.push(exactMatchAdvice);
+            console.log(`BPA: Created exact match RegexAdvice for pattern ${pattern.name} based on snippet search.`);
+          }
+        } catch (e) {
+          console.warn(`BPA: Error searching for exact code snippet for pattern ${pattern.name}: ${(e as Error).message}`);
+        }
+      }
+    }
+
+
+    // Try to generate a generalized regex from vulnerable code example (fallback/complementary)
+    if (pattern.exampleVulnerableCode) {
+      const potentialRegex = this.extractRegexFromExample(pattern.exampleVulnerableCode);
+      if (potentialRegex) {
+        // Avoid duplicating if the exact match advice already used the same pattern (less likely but possible)
+        if (!this.sharedContext.contextualAdvice.find(a => a.type === ContextualAdviceType.Regex && (a as RegexAdvice).regexPattern === potentialRegex && a.adviceId.startsWith('bpa-exactmatch'))) {
+          const regexAdvice: RegexAdvice = {
+            adviceId: `bpa-rgx-${pattern.id}-${Date.now()}`,
+            sourceAgent: this.type,
+            type: ContextualAdviceType.Regex,
+            regexPattern: potentialRegex,
+            advice: `Potential vulnerability related to '${pattern.name}'. Description: ${pattern.description.substring(0,100)}... A generalized pattern derived from its example ('${potentialRegex}') might indicate this vulnerability. Severity: ${pattern.severity || 'N/A'}.`,
+            description: `Generalized regex from vulnerable code example for pattern: ${pattern.name}`,
+            priority: pattern.severity === 'Critical' || pattern.severity === 'High' ? 7 : 5, // Slightly lower than exact match
+            createdAt: new Date().toISOString(),
+          };
+          this.sharedContext.contextualAdvice.push(regexAdvice);
+        }
+      }
+    }
+
+    // General advice based on the bug pattern (always add this)
+    const generalAdvice: GeneralAdvice = {
+      adviceId: `bpa-gen-${pattern.id}-${Date.now()}`,
+      sourceAgent: this.type,
+      type: ContextualAdviceType.General,
+      advice: `Be aware of bug pattern '${pattern.name}' (Severity: ${pattern.severity || 'N/A'}). Description: ${pattern.description}. Tags: ${(pattern.tags || []).join(', ')}. This is relevant when reviewing code that might involve ${pattern.tags.join(', or ')}.`,
+      keywords: [...(pattern.tags || []), pattern.name.toLowerCase()],
+      description: `General advice for bug pattern: ${pattern.name}`,
+      priority: pattern.severity === 'Critical' || pattern.severity === 'High' ? 7 : 5,
+      createdAt: new Date().toISOString(),
+    };
+    this.sharedContext.contextualAdvice.push(generalAdvice);
+
+    // Clean up old advice from this agent
+    const maxBpaAdvice = this.config.maxContextualAdviceItemsPerAgentBPA || 30; // New config option
+    const bpaAdviceEntries = this.sharedContext.contextualAdvice.filter(a => a.sourceAgent === this.type);
+    if (bpaAdviceEntries.length > maxBpaAdvice) {
+        bpaAdviceEntries.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        const adviceToRemove = bpaAdviceEntries.slice(maxBpaAdvice).map(a => a.adviceId);
+        this.sharedContext.contextualAdvice = this.sharedContext.contextualAdvice.filter(a => !adviceToRemove.includes(a.adviceId));
+    }
+     console.log(`BPA: Generated contextual advice for pattern ${pattern.name}. Total BPA advice: ${this.sharedContext.contextualAdvice.filter(a => a.sourceAgent === this.type).length}`);
+  }
+
+  // Helper to attempt to extract a simple regex from code.
+  // This is very basic and can be significantly improved.
+  private extractRegexFromExample(code: string): string | undefined {
+    // Look for function calls like: some_function(...) or object->method(...)
+    const funcCallMatch = code.match(/(\b\w+(?:->|::)\w+\b\s*\(|\b\w+\s*\()/);
+    if (funcCallMatch && funcCallMatch[1]) {
+      // Escape special characters for regex and make it more general
+      let pattern = funcCallMatch[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (pattern.endsWith('\\(')) { // if it's a function call
+        pattern = pattern.slice(0, -2) + '\\s*\\('; // Allow space before parenthesis
+      }
+      return pattern;
+    }
+    // Look for assignments like: variable = vulnerable_source...
+    const assignmentMatch = code.match(/(\b\w+\b\s*=\s*\b\w+\b)/);
+    if (assignmentMatch && assignmentMatch[1]) {
+        return assignmentMatch[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    return undefined;
   }
 
   public async getContextualAdvice(codeSnippet: string): Promise<string> {
