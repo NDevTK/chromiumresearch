@@ -39,6 +39,9 @@ export interface BugPatternAnalysisConfig {
   idleCycleDelayMsBPA?: number; // Delay when no work is found in continuous loop for BPA
   itemProcessingCheckIntervalMsBPA?: number; // How often to check if current item is done for BPA
   interItemDelayMsBPA?: number; // Small delay between processing items in BPA loop
+  maxIssuePagesToScanPerCycle?: number; // Max issue pages to scan before resetting pagination
+  // maxCommitPagesToScanPerCycle is removed as commit pagination is simplified
+  resetPaginationAfterIdleMinutes?: number; // After minutes of full idle, reset pagination (conceptual for now)
 }
 
 export interface CodebaseUnderstandingConfig {
@@ -104,6 +107,9 @@ const DEFAULT_AGENT_CONFIG: AgentConfig = {
     idleCycleDelayMsBPA: 20000, // 20 seconds delay when idle
     itemProcessingCheckIntervalMsBPA: 1000, // 1 second check if busy
     interItemDelayMsBPA: 300, // 0.3 seconds between items
+    maxIssuePagesToScanPerCycle: 10, // Default: scan up to 10 pages of issues before reset
+    // maxCommitPagesToScanPerCycle: 5, // Removed
+    resetPaginationAfterIdleMinutes: 60, // Default: reset pagination if idle for 60 mins (conceptual)
   },
   codebaseUnderstanding: {
     filesPerModuleCycle: 3, // During a specific module's deep dive (still relevant for performSingleModuleAnalysis)
