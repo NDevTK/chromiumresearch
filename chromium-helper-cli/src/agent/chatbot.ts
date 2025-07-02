@@ -2,8 +2,8 @@
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { LLMResearcher } from './researcher.js';
-import { SpecializedAgentType } from './specialized_agents.js'; // Added import
-import { GenericTaskAgentConfig } from '../agent_config.js'; // Added import
+import { SpecializedAgentType } from './agents/index.js'; // Updated path to barrel file
+import { GenericTaskAgentConfig } from '../agent_config.js';
 
 export class Chatbot {
   private rl: readline.Interface;
@@ -106,7 +106,7 @@ export class Chatbot {
                   // Remaining args joined and parsed as JSON
                   wfParams = JSON.parse(args.join(' '));
                 } catch (e) {
-                  response = `Error parsing workflow parameters: ${(e as Error).message}. Parameters should be a valid JSON string. Usage: !workflow <workflowId> '{"key": "value"}'`;
+                  response = `Error parsing workflow parameters: ${(e as Error).message}. \nParameters should be a valid JSON string, enclosed in single quotes if it contains spaces. \nExample: !workflow ${workflowId} '{"key": "value", "anotherKey": 123}'`;
                   break;
                 }
               }
@@ -123,7 +123,26 @@ export class Chatbot {
             // Also, specific agent status can be fetched via !agent-status <GenericTaskAgentID>
             if (command === 'agent-status' && args[0]?.startsWith('generic-task-')) {
                  response = await this.researcher.getAgentStatus(args[0] as any); // Agent ID is used directly
-            } else {
+            } else if (command === 'list-agent-requests') {
+                // Parse simple --key value arguments for filtering
+                const filters: { status?: string; agentType?: SpecializedAgentType | string; id?: string } = {};
+                for (let i = 0; i < args.length; i += 2) {
+                    const key = args[i].startsWith('--') ? args[i].substring(2) : null;
+                    const value = args[i+1];
+                    if (key && value) {
+                        if (key === 'status') filters.status = value;
+                        else if (key === 'agent' || key === 'agentType') filters.agentType = value as SpecializedAgentType;
+                        else if (key === 'id') filters.id = value;
+                    } else {
+                        response = "Invalid filter format for !list-agent-requests. Use --key value.";
+                        break;
+                    }
+                }
+                if (!response) { // if no error in parsing filters
+                    response = await this.researcher.listAgentRequests(filters);
+                }
+            }
+            else {
                 response = await this.researcher.invokeTool(input);
             }
             break;

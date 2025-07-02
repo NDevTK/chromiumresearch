@@ -26,11 +26,13 @@ import {
   CodebaseUnderstandingAgent,
   GenericTaskAgent,
   SpecializedAgentType,
-  SharedAgentContextType, // Added SharedAgentContextType
-  KeyFileWithSymbols // Added KeyFileWithSymbols for typing 'f'
-} from './specialized_agents.js';
+  SharedAgentContextType,
+  KeyFileWithSymbols,
+  BugPattern, // Added BugPattern for explicit typing
+  AgentRequest // Added AgentRequest for explicit typing
+} from './agents/index.js'; // Updated path to barrel file
 import { ChromiumAPI } from '../api.js';
-import { loadConfig as loadChromiumHelperConfig, Config as CHConfig } from '../config.js'; // Changed CHConfig to Config
+import { loadConfig as loadChromiumHelperConfig, Config as CHConfig } from '../config.js';
 import { AgentConfig, loadAgentConfig, GenericTaskAgentConfig } from '../agent_config.js'; // Added GenericTaskAgentConfig import
 
 
@@ -57,13 +59,15 @@ export class LLMResearcher {
     };
     this.llmComms = new LLMCommunication(llmApiConfig, this.agentConfig.llm.cacheMaxSize); // Pass cache size
     this.storage = new PersistentStorage('LLMResearcher_main');
-    this.specializedAgents = new Map();
-    // Initialize with the correct type
+    this.specializedAgents = new Map(); // This will store the actual agent instances
+    // Initialize sharedAgentContext, including a placeholder for specializedAgents map
     this.sharedAgentContext = {
       findings: [],
       requests: [],
       knownBugPatterns: [],
       codebaseInsights: {},
+      recentEvents: [],
+      specializedAgents: this.specializedAgents // Share the map
     };
     // Note: chromiumApi is not initialized here yet.
   }
@@ -71,6 +75,8 @@ export class LLMResearcher {
   public static async create(): Promise<LLMResearcher> {
     const agentConfig = await loadAgentConfig(); // Load config first
     const researcher = new LLMResearcher(agentConfig); // Pass it to constructor
+    // IMPORTANT: Initialize async components which includes creating agent instances
+    // and thus populating this.specializedAgents (which is referenced by this.sharedAgentContext.specializedAgents)
     await researcher.initializeAsyncComponents();
     return researcher;
   }
@@ -83,16 +89,17 @@ export class LLMResearcher {
       this.chromiumApi.setDebugMode(process.env.CH_AGENT_DEBUG === 'true');
       console.log("ChromiumAPI initialized for LLMResearcher.");
 
-      // Now that chromiumApi is initialized, we can create specialized agents that depend on it.
+      // Create specialized agents and populate this.specializedAgents.
+      // Since this.sharedAgentContext.specializedAgents references this.specializedAgents,
+      // it will be correctly populated once this method finishes.
       this.initializeSpecializedAgents();
+
       this.initializeWorkflows(); // Initialize/register workflows
       await this.loadResearcherData(); // Load persistent data
       console.log("LLM Researcher fully initialized.");
 
     } catch (error) {
       console.error("Failed to initialize LLMResearcher's async components:", error);
-      // Decide how to handle this - throw, or operate in a degraded mode?
-      // For now, if ChromiumAPI fails, many features will be broken.
       throw new Error("LLMResearcher async initialization failed.");
     }
   }
@@ -445,6 +452,129 @@ Provide a final summary, overall assessment (e.g., potential risks, confidence i
     this.registerWorkflow(deepDiveClAnalysisWorkflow);
 
     // TODO: Define more workflows like "New API Security Check"
+
+    // --- Define "Security Audit Module" Workflow ---
+    const securityAuditModuleWorkflow: WorkflowDefinition = {
+      id: "security-audit-module",
+      description: "Performs a security audit of a Chromium module: CUA for insight, PBF for vulnerability scan of key files, BPAA for pattern analysis, and LLM for final report.",
+      defaultParams: {
+        maxFilesToScanByPBF: 3, // Max key files PBF will be asked to scan from CUA insight
+      },
+      steps: [
+        {
+          name: "Get Module Insight (CUA)",
+          description: "Fetches or generates an insight for the specified module using CodebaseUnderstandingAgent.",
+          requiredParams: ["modulePath"],
+          action: async (params) => {
+            const cua = this.sharedAgentContext.specializedAgents?.get(SpecializedAgentType.CodebaseUnderstanding) as CodebaseUnderstandingAgent | undefined;
+            if (!cua) return JSON.stringify({ error: "CodebaseUnderstandingAgent not available.", moduleInsight: null, keyFilesForPBF: [] });
+
+            // Ensure CUA analyzes/updates the module
+            await cua.performSingleModuleAnalysis(params.modulePath);
+            const insight = this.sharedAgentContext.codebaseInsights[params.modulePath];
+            if (!insight) return JSON.stringify({ error: `Failed to get insight for module ${params.modulePath}.`, moduleInsight: null, keyFilesForPBF: [] });
+
+            // Select key files for PBF to scan (e.g., based on description length, or specific markers if CUA adds them)
+            const keyFilesForPBF = (insight.keyFiles || [])
+                .sort((a,b) => (b.description?.length || 0) - (a.description?.length || 0)) // Simplistic: longer description = more important
+                .slice(0, params.maxFilesToScanByPBF || 3)
+                .map(kf => kf.filePath);
+
+            return JSON.stringify({
+              moduleInsight: insight,
+              keyFilesForPBF,
+              reportSection_CUA: `CUA Insight for ${params.modulePath}:\nSummary: ${insight.summary}\nCommon Risks: ${(insight.commonSecurityRisks || []).join(', ')}\nKey Files Identified: ${(insight.keyFiles || []).map(f=>f.filePath).join(', ')}\n`
+            });
+          }
+        },
+        {
+          name: "Vulnerability Scan of Key Files (PBF)",
+          description: "Uses ProactiveBugFinder to scan selected key files from the module for vulnerabilities.",
+          requiredParams: ["modulePath", "keyFilesForPBF", "moduleInsight"], // moduleInsight for context if PBF uses it
+          action: async (params) => {
+            const pbf = this.sharedAgentContext.specializedAgents?.get(SpecializedAgentType.ProactiveBugFinding) as ProactiveBugFinder | undefined;
+            if (!pbf) return JSON.stringify({ error: "ProactiveBugFinder agent not available.", pbfScanResults: [] });
+
+            let pbfScanResults: Array<{file: string, analysis: string}> = [];
+            let reportSection_PBF = "PBF Scan Results:\n";
+
+            if (!params.keyFilesForPBF || params.keyFilesForPBF.length === 0) {
+                reportSection_PBF += "  No key files identified by CUA for PBF scan.\n";
+            } else {
+                for (const filePath of params.keyFilesForPBF) {
+                    try {
+                        console.log(`Workflow 'security-audit-module': PBF scanning ${filePath}`);
+                        // PBF's analyzeSpecificFile now takes context from CUA via shared context,
+                        // but we could also pass moduleInsight data explicitly if needed.
+                        const analysis = await pbf.analyzeSpecificFile(filePath);
+                        pbfScanResults.push({ file: filePath, analysis });
+                        reportSection_PBF += `  File: ${filePath}\n    Analysis: ${analysis.substring(0, 200)}...\n`;
+                    } catch (e) {
+                        const errorMsg = `Error scanning file ${filePath} with PBF: ${(e as Error).message}`;
+                        console.error(errorMsg);
+                        pbfScanResults.push({ file: filePath, analysis: errorMsg });
+                        reportSection_PBF += `  File: ${filePath}\n    Error: ${errorMsg}\n`;
+                    }
+                }
+            }
+            return JSON.stringify({ pbfScanResults, reportSection_PBF });
+          }
+        },
+        {
+          name: "Bug Pattern Analysis (BPAA)",
+          description: "Uses BugPatternAnalysisAgent to check PBF findings against known patterns or extract new ones.",
+          requiredParams: ["pbfScanResults"],
+          action: async (params) => {
+            const bpaa = this.sharedAgentContext.specializedAgents?.get(SpecializedAgentType.BugPatternAnalysis) as BugPatternAnalysisAgent | undefined;
+            if (!bpaa) return JSON.stringify({ error: "BugPatternAnalysisAgent not available.", bpaaAnalysis: "BPAA not available." });
+
+            let bpaaCombinedAnalysis = "";
+            if (params.pbfScanResults && params.pbfScanResults.length > 0) {
+                for (const finding of params.pbfScanResults) {
+                    if (finding.analysis && !finding.analysis.startsWith("Error:")) {
+                         // Get contextual advice for the analysis snippet
+                        const advice = await bpaa.getContextualAdvice(finding.analysis.substring(0,1000)); // Send PBF analysis text
+                        bpaaCombinedAnalysis += `  For PBF finding in ${finding.file}:\n    BPAA Advice: ${advice}\n`;
+                        // TODO: Potentially trigger BPAA to try and extract a new pattern if PBF output is detailed enough
+                    }
+                }
+            }
+            if (!bpaaCombinedAnalysis) bpaaCombinedAnalysis = "No significant PBF findings to analyze with BPAA or BPAA provided no specific advice.";
+
+            return JSON.stringify({
+              bpaaAnalysis: bpaaCombinedAnalysis,
+              reportSection_BPAA: `BPAA Analysis of PBF Findings:\n${bpaaCombinedAnalysis}\n`
+            });
+          }
+        },
+        {
+          name: "Synthesize Module Security Report (LLM)",
+          description: "Combines all gathered information (CUA insight, PBF scans, BPAA analysis) into a final security report for the module using an LLM.",
+          requiredParams: ["modulePath", "reportSection_CUA", "reportSection_PBF", "reportSection_BPAA"],
+          action: async (params) => {
+            const synthesisPrompt = `
+Synthesize a comprehensive security audit report for Chromium module: "${params.modulePath}"
+Based on the following sections:
+
+1. Codebase Understanding Agent (CUA) Insight:
+${params.reportSection_CUA}
+
+2. Proactive Bug Finder (PBF) Scan of Key Files:
+${params.reportSection_PBF}
+
+3. Bug Pattern Analysis Agent (BPAA) Review:
+${params.reportSection_BPAA}
+
+Provide a final summary, overall assessment of the module's security posture, key risks identified, and any actionable recommendations. Be factual and concise.
+`;
+            const finalReport = await this.llmComms.sendMessage(synthesisPrompt, "You are an AI security analyst compiling a module audit report.");
+            return finalReport; // This is the final output of the workflow
+          }
+        }
+      ]
+    };
+    this.registerWorkflow(securityAuditModuleWorkflow);
+
     console.log("Workflows initialized.");
   }
 
@@ -545,8 +675,15 @@ Interactions:
    Example: User: "analyze components/foo/bar.cc for bugs"
    AI: I will ask the ProactiveBugFinder agent to analyze that file.
    DELEGATE_TASK: {"targetAgentType": "ProactiveBugFinding", "taskType": "analyze_file_for_vulnerabilities", "params": {"filePath": "components/foo/bar.cc"}, "userQuery": "analyze components/foo/bar.cc for bugs"}
-4. GENERAL QUERY: For other questions, provide a helpful textual response, possibly incorporating information from the shared agent context.
+4. SUGGEST WORKFLOW: If the query matches a known complex task that has a defined workflow (e.g., "audit CL 12345"), suggest running the workflow.
+   Example: User: "audit CL 12345" -> AI: You can use the 'basic-cl-audit' workflow for this. Try: !workflow basic-cl-audit '{"clNumber": "12345"}'
+5. SYNTHESIZE_OVERVIEW: If the user asks for a security overview, summary of issues, or to correlate information about a specific file, module, or topic (e.g., "summarize security issues for file X", "what do we know about module Y?", "correlate findings for 'mojo vulnerability'"), use this action. Output it on a new line, prefixed with 'SYNTHESIZE_OVERVIEW: '. The value should be a short JSON string indicating the topic and type, e.g., '{"topic": "path/to/file.cc", "type": "file"}'.
+   Example: User: "Summarize security issues for chrome/browser/foo.cc"
+   AI: I will gather and synthesize information for that file.
+   SYNTHESIZE_OVERVIEW: {"topic": "chrome/browser/foo.cc", "type": "file"}
+6. GENERAL QUERY: For other questions, first consider if information from the 'sharedAgentContext' (recent findings, module insights, bug patterns) can answer the query. If so, synthesize an answer from that context. Otherwise, provide a general helpful textual response.
 
+Prioritize using tools, delegating to agents, suggesting workflows, or synthesizing overviews over general answers if the user's intent can be met by these more specific actions.
 Always be concise. The user is interacting with you via a CLI chatbot.`;
 
     let enrichedQuery = query;
@@ -619,42 +756,73 @@ Always be concise. The user is interacting with you via a CLI chatbot.`;
     // Add agent contributions to the main query for the LLM, if any
     if (agentContributions) {
       enrichedQuery = `${query}\n\nRelevant information from active agents and shared context:\n${agentContributions}`;
-      console.log("LLMResearcher: Enriched query with agent contributions from shared context.");
     }
+
+    // Add high-confidence/severity bug patterns to context for LLM awareness
+    if (this.sharedAgentContext.knownBugPatterns && this.sharedAgentContext.knownBugPatterns.length > 0) {
+      const highImpactPatterns = this.sharedAgentContext.knownBugPatterns
+        .filter(p => typeof p !== 'string' && (p.confidence === 'High' || p.severity === 'Critical' || p.severity === 'High'))
+        .slice(0, 5) // Limit to top 5 for brevity
+        .map(p => `- ${(p as BugPattern).name}: ${(p as BugPattern).description.substring(0,100)}... (Severity: ${(p as BugPattern).severity || 'N/A'}, Conf: ${(p as BugPattern).confidence || 'N/A'})`)
+        .join("\n");
+
+      if (highImpactPatterns) {
+        const patternContext = `\n\nKey Known Bug Patterns (High Impact):\n${highImpactPatterns}\nConsider these patterns when analyzing user queries related to vulnerabilities or code review.`;
+        if (enrichedQuery === query) { // No other agent contributions yet
+            enrichedQuery = `${query}${patternContext}`;
+        } else { // Append to existing contributions
+            enrichedQuery += patternContext;
+        }
+        console.log("LLMResearcher: Enriched query with key bug patterns.");
+      }
+    }
+
+    if (enrichedQuery !== query) { // Log if query was enriched at all
+        console.log("LLMResearcher: Query enriched for LLM.");
+    }
+
 
     try {
       let llmResponse = await this.llmComms.sendMessage(enrichedQuery, systemPrompt);
 
-      await this.saveResearcherData({ lastQuery: query, lastResponseTimestamp: new Date().toISOString(), enrichedQueryProvided: !!agentContributions });
+      await this.saveResearcherData({ lastQuery: query, lastResponseTimestamp: new Date().toISOString(), enrichedQueryProvided: enrichedQuery !== query });
 
       const executeCommandPrefix = "EXECUTE_COMMAND: ";
       const delegateTaskPrefix = "DELEGATE_TASK: ";
+      const synthesizeOverviewPrefix = "SYNTHESIZE_OVERVIEW: "; // New prefix
       const lines = llmResponse.split('\n');
       let commandToExecute: string | null = null;
-      let taskToDelegate: any = null; // Will hold the parsed JSON for the task
+      let taskToDelegate: any = null;
+      let synthesisRequest: {topic: string, type: "file" | "module" | "general"} | null = null; // New request type
       let conversationalPart = "";
       let responseToSendToUser = "";
 
       for (let i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith(executeCommandPrefix)) {
-          commandToExecute = lines[i].substring(executeCommandPrefix.length).trim();
+        const currentLine = lines[i];
+        if (currentLine.startsWith(executeCommandPrefix)) {
+          commandToExecute = currentLine.substring(executeCommandPrefix.length).trim();
           conversationalPart = lines.slice(0, i).join('\n').trim();
-          // Any lines after EXECUTE_COMMAND are ignored by the execution logic.
           break;
-        } else if (lines[i].startsWith(delegateTaskPrefix)) {
+        } else if (currentLine.startsWith(delegateTaskPrefix)) {
           try {
-            const taskJsonString = lines[i].substring(delegateTaskPrefix.length).trim();
+            const taskJsonString = currentLine.substring(delegateTaskPrefix.length).trim();
             taskToDelegate = JSON.parse(taskJsonString);
             conversationalPart = lines.slice(0, i).join('\n').trim();
-            // Any lines after DELEGATE_TASK are considered part of the conversational response.
-            if (lines.length > i + 1) {
-                conversationalPart += "\n" + lines.slice(i + 1).join("\n");
-            }
+            if (lines.length > i + 1) conversationalPart += "\n" + lines.slice(i + 1).join("\n");
           } catch (e) {
-            console.error("LLMResearcher: Failed to parse DELEGATE_TASK JSON:", e, lines[i]);
-            // Fallback to treating the whole LLM response as conversational if parsing fails
-            taskToDelegate = null; // Ensure it's null so it doesn't proceed with bad data
-            conversationalPart = llmResponse; // Use the full original response
+            console.error("LLMResearcher: Failed to parse DELEGATE_TASK JSON:", e, currentLine);
+            taskToDelegate = null; conversationalPart = llmResponse;
+          }
+          break;
+        } else if (currentLine.startsWith(synthesizeOverviewPrefix)) {
+          try {
+            const synthesisJsonString = currentLine.substring(synthesizeOverviewPrefix.length).trim();
+            synthesisRequest = JSON.parse(synthesisJsonString);
+            conversationalPart = lines.slice(0, i).join('\n').trim();
+             if (lines.length > i + 1) conversationalPart += "\n" + lines.slice(i + 1).join("\n");
+          } catch (e) {
+            console.error("LLMResearcher: Failed to parse SYNTHESIZE_OVERVIEW JSON:", e, currentLine);
+            synthesisRequest = null; conversationalPart = llmResponse;
           }
           break;
         }
@@ -666,8 +834,56 @@ Always be concise. The user is interacting with you via a CLI chatbot.`;
         responseToSendToUser = (conversationalPart ? conversationalPart + "\n" : "") + `Tool Output:\n${toolOutput}`;
       } else if (taskToDelegate && taskToDelegate.targetAgentType && taskToDelegate.taskType && taskToDelegate.params) {
         const requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        const newRequest: AgentRequest = {
+        const newRequest: AgentRequest = { // Ensure AgentRequest fields are correctly populated
           requestId,
+          targetAgentType: taskToDelegate.targetAgentType as SpecializedAgentType,
+          taskType: taskToDelegate.taskType,
+          params: taskToDelegate.params,
+          requestingAgentId: "ChatbotLLM",
+          status: "pending",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          priority: taskToDelegate.priority || 50,
+        };
+        this.sharedAgentContext.requests.push(newRequest);
+        console.log(`LLMResearcher: Delegated task ${requestId} to ${newRequest.targetAgentType} for task ${newRequest.taskType}.`);
+
+        let delegationMessage = `Task delegated to ${newRequest.targetAgentType} with ID: ${requestId}.`;
+        delegationMessage += `\nTask Type: ${newRequest.taskType}.`;
+        delegationMessage += `\nUse '!list-agent-requests --id ${requestId}' or '!agent-status ${requestId}' to track.`;
+
+        if (conversationalPart.trim()) {
+            responseToSendToUser = conversationalPart + `\n${delegationMessage}`;
+        } else {
+            responseToSendToUser = `I've tasked the ${newRequest.targetAgentType} agent with: ${newRequest.taskType} (Params: ${JSON.stringify(newRequest.params).substring(0,50)}...). \n${delegationMessage}`;
+        }
+      } else if (synthesisRequest && synthesisRequest.topic && synthesisRequest.type) {
+        console.log(`LLMResearcher: Synthesizing overview for topic "${synthesisRequest.topic}" (type: ${synthesisRequest.type}).`);
+        const gatheredContext = await this.gatherContextForSynthesis(synthesisRequest.topic, synthesisRequest.type);
+        const synthesisSystemPrompt = "You are an AI security analyst. Synthesize the provided information into a coherent security overview for the user. Highlight key risks, vulnerabilities, or important contextual points. Be clear and concise.";
+        const synthesisUserPrompt = `${gatheredContext}\n\nPlease provide a synthesized security overview based on the information above for topic: "${synthesisRequest.topic}".`;
+
+        const synthesizedReport = await this.llmComms.sendMessage(synthesisUserPrompt, synthesisSystemPrompt);
+        responseToSendToUser = (conversationalPart ? conversationalPart + "\n" : "") + `Synthesized Overview for "${synthesisRequest.topic}":\n${synthesizedReport}`;
+      }
+       else {
+        // No command, no delegation, just a general LLM response
+        responseToSendToUser = llmResponse;
+      }
+
+      // Log recent findings from shared context for debugging/visibility (optional)
+      // if (this.sharedAgentContext.findings.length > 0) {
+      //   console.log(`LLMResearcher: Recent findings: ${JSON.stringify(this.sharedAgentContext.findings.slice(-3))}`);
+      // }
+
+      return responseToSendToUser;
+    } catch (error) {
+      console.error("Error processing query in LLMResearcher:", error);
+      return "Sorry, I encountered an error trying to process your request.";
+    }
+  }
+
+  public async invokeTool(toolCommand: string): Promise<string> {
           targetAgentType: taskToDelegate.targetAgentType as SpecializedAgentType,
           taskType: taskToDelegate.taskType,
           params: taskToDelegate.params,
@@ -683,10 +899,15 @@ Always be concise. The user is interacting with you via a CLI chatbot.`;
         // Construct user message
         // The conversationalPart might already be the AI's explanation (e.g., "I will ask the PBF agent...")
         // If not, generate a default one.
+        let delegationMessage = `Task delegated to ${newRequest.targetAgentType} with ID: ${requestId}.`;
+        delegationMessage += `\nTask Type: ${newRequest.taskType}.`;
+        delegationMessage += `\nUse '!list-agent-requests --id ${requestId}' or '!agent-status ${requestId}' to track.`;
+
         if (conversationalPart.trim()) {
-            responseToSendToUser = conversationalPart + `\n(Task ID: ${requestId} created for ${newRequest.targetAgentType})`;
+            responseToSendToUser = conversationalPart + `\n${delegationMessage}`;
         } else {
-            responseToSendToUser = `I've tasked the ${newRequest.targetAgentType} agent with: ${newRequest.taskType} (Params: ${JSON.stringify(newRequest.params).substring(0,50)}...). Task ID: ${requestId}. You can check status with !list-agent-requests.`;
+            // Construct a default conversational part if LLM didn't provide one
+            responseToSendToUser = `I've tasked the ${newRequest.targetAgentType} agent with: ${newRequest.taskType} (Params: ${JSON.stringify(newRequest.params).substring(0,50)}...). \n${delegationMessage}`;
         }
 
       } else {
@@ -1086,13 +1307,19 @@ Always be concise. The user is interacting with you via a CLI chatbot.`;
 
       // Check for required parameters for the step
       if (step.requiredParams) {
+        const missingParams: string[] = [];
         for (const reqParam of step.requiredParams) {
-          if (!(reqParam in mergedParams)) {
-            const errorMsg = `Error: Missing required parameter '${reqParam}' for step '${step.name}' in workflow '${workflowId}'.`;
-            console.error(errorMsg);
-            fullReport += `${errorMsg}\nWorkflow terminated prematurely.\n`;
-            return fullReport;
+          if (!(reqParam in mergedParams) || mergedParams[reqParam] === undefined || mergedParams[reqParam] === null) {
+            missingParams.push(reqParam);
           }
+        }
+        if (missingParams.length > 0) {
+          let errorMsg = `Error: Missing required parameter(s) for step '${step.name}' in workflow '${workflowId}': ${missingParams.join(', ')}.`;
+          errorMsg += `\nPlease provide these parameters. You can ask the AI to help you formulate the JSON parameters for the workflow.`;
+          errorMsg += `\nExample: !workflow ${workflowId} '{"${missingParams[0]}": "value", ...}'`;
+          console.error(errorMsg);
+          fullReport += `${errorMsg}\nWorkflow terminated prematurely.\n`;
+          return fullReport;
         }
       }
 
@@ -1128,7 +1355,12 @@ Always be concise. The user is interacting with you via a CLI chatbot.`;
       }
     }
 
-    fullReport += "--- Workflow Completed Successfully ---\n";
+    fullReport += "\n--- Workflow Completed Successfully ---\n";
+    // The last step's result is often the main synthesis, so we ensure it's prominent.
+    // If the last step's result was merged into params (e.g. as a JSON object), this won't re-print it,
+    // but if it was a final string (like a report), it's already in fullReport.
+    // We can add a concluding message.
+    fullReport += `Final output for workflow ${workflow.id} is detailed above.`;
     console.log(`Workflow ${workflow.id} completed.`);
     return fullReport;
   }
@@ -1147,36 +1379,132 @@ Always be concise. The user is interacting with you via a CLI chatbot.`;
     return info;
   }
 
-  public listAgentRequests(): string {
+  public listAgentRequests(filters?: { status?: string; agentType?: SpecializedAgentType | string; id?: string }): string {
     if (!this.sharedAgentContext || !this.sharedAgentContext.requests || this.sharedAgentContext.requests.length === 0) {
       return "No agent requests found in the shared context.";
     }
-    let report = "Current Agent Requests:\n";
-    // Sort by priority (lower first) then by creation date
-    const sortedRequests = [...this.sharedAgentContext.requests].sort((a, b) => {
-        const priorityDiff = (a.priority ?? 100) - (b.priority ?? 100);
-        if (priorityDiff !== 0) return priorityDiff;
-        return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+
+    let filteredRequests = [...this.sharedAgentContext.requests];
+
+    if (filters?.id) {
+      filteredRequests = filteredRequests.filter(req => req.requestId === filters.id);
+    }
+    if (filters?.status) {
+      filteredRequests = filteredRequests.filter(req => req.status.toLowerCase() === filters.status?.toLowerCase());
+    }
+    if (filters?.agentType) {
+      filteredRequests = filteredRequests.filter(req => req.targetAgentType.toLowerCase() === filters.agentType?.toLowerCase());
+    }
+
+    if (filteredRequests.length === 0) {
+      return "No agent requests match the specified filters.";
+    }
+
+    // Sort by priority (lower first) then by creation date (most recent first for active, oldest first for completed/failed)
+    const sortedRequests = filteredRequests.sort((a, b) => {
+      const priorityDiff = (a.priority ?? 100) - (b.priority ?? 100);
+      if (priorityDiff !== 0) return priorityDiff;
+      if (a.status === "pending" || a.status === "in_progress") {
+        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(); // Recent pending first
+      }
+      return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(); // Oldest completed/failed first
     });
+
+    let report = `Agent Requests (${sortedRequests.length} matching filter):\n`;
+    report += `  Applied Filters: ${filters ? JSON.stringify(filters) : 'None'}\n`;
+    report += `  Use !list-agent-requests --status <pending|completed|failed> --agent <AgentType> --id <requestID>\n\n`;
+
 
     for (const req of sortedRequests) {
       report += `------------------------------------\n`;
-      report += `ID: ${req.requestId}\n`;
-      report += `Target: ${req.targetAgentType}\n`;
-      report += `Task: ${req.taskType}\n`;
-      report += `Status: ${req.status}\n`;
-      report += `Created: ${new Date(req.createdAt).toLocaleString()}\n`;
-      report += `Updated: ${new Date(req.updatedAt).toLocaleString()}\n`;
-      if (req.requestingAgentId) report += `Requester: ${req.requestingAgentId}\n`;
-      if (req.priority) report += `Priority: ${req.priority}\n`;
-      report += `Params: ${JSON.stringify(req.params).substring(0, 100)}${JSON.stringify(req.params).length > 100 ? '...' : ''}\n`;
+      report += ` ID        : ${req.requestId}\n`;
+      report += ` Target    : ${req.targetAgentType}\n`;
+      report += ` Task      : ${req.taskType}\n`;
+      report += ` Status    : ${req.status.toUpperCase()}\n`;
+      report += ` Priority  : ${req.priority ?? 'N/A'}\n`;
+      report += ` Created   : ${new Date(req.createdAt).toLocaleString()}\n`;
+      report += ` Updated   : ${new Date(req.updatedAt).toLocaleString()}\n`;
+      if (req.requestingAgentId) report += ` Requester : ${req.requestingAgentId}\n`;
+
+      const paramsStr = JSON.stringify(req.params);
+      report += ` Params    : ${paramsStr.substring(0, 80)}${paramsStr.length > 80 ? '...' : ''}\n`;
+
       if (req.status === "completed" && req.result) {
-        report += `Result: ${JSON.stringify(req.result).substring(0, 150)}${JSON.stringify(req.result).length > 150 ? '...' : ''}\n`;
+        const resultStr = typeof req.result === 'string' ? req.result : JSON.stringify(req.result);
+        report += ` Result    : ${resultStr.substring(0, 120)}${resultStr.length > 120 ? '...' : ''}\n`;
       } else if (req.status === "failed" && req.error) {
-        report += `Error: ${req.error}\n`;
+        report += ` Error     : ${req.error}\n`;
       }
     }
-    report += `------------------------------------\nTotal requests: ${this.sharedAgentContext.requests.length}\n`;
+    report += `------------------------------------\nTotal requests in context: ${this.sharedAgentContext.requests.length}\n`;
     return report;
   }
+
+  private async gatherContextForSynthesis(topic: string, type: "file" | "module" | "general"): Promise<string> {
+    let context = `Synthesizing information related to: ${topic} (type: ${type})\n`;
+    const MAX_ITEMS = 3; // Max items per category to keep context manageable
+
+    // 1. Findings from ProactiveBugFinder or other direct analyses
+    if (this.sharedAgentContext.findings.length > 0) {
+      const relevantFindings = this.sharedAgentContext.findings.filter(f =>
+        (f.data.file && f.data.file.includes(topic)) ||
+        (f.data.modulePath && f.data.modulePath.includes(topic)) ||
+        (f.data.analysis && f.data.analysis.toLowerCase().includes(topic.toLowerCase())) ||
+        (f.type.toLowerCase().includes(topic.toLowerCase()))
+      ).slice(0 - MAX_ITEMS); // Get last MAX_ITEMS
+
+      if (relevantFindings.length > 0) {
+        context += "\n--- Relevant Recent Findings ---\n";
+        relevantFindings.forEach(f => {
+          context += `Source: ${f.sourceAgent}, Type: ${f.type}, Date: ${f.timestamp.toLocaleDateString()}\n`;
+          if (f.data.file) context += `File: ${f.data.file}\n`;
+          if (f.data.analysis) context += `Analysis Summary: ${f.data.analysis.substring(0, 200)}...\n`;
+          else if (f.data.summary) context += `Summary: ${f.data.summary.substring(0,200)}...\n`;
+          else context += `Data: ${JSON.stringify(f.data).substring(0,150)}...\n`;
+          context += "---\n";
+        });
+      }
+    }
+
+    // 2. Codebase Insights from CodebaseUnderstandingAgent
+    if (type === "file" || type === "module") {
+        const modulePath = (type === "file") ? this.getParentModulePathForContext(topic) : topic;
+        const insight = this.sharedAgentContext.codebaseInsights[modulePath];
+        if (insight) {
+            context += "\n--- Codebase Module Insight ---\n";
+            context += `Module: ${insight.modulePath}\nSummary: ${insight.summary}\n`;
+            if (insight.keyFiles) context += `Key Files: ${insight.keyFiles.slice(0,MAX_ITEMS).map(kf => kf.filePath).join(', ')}\n`;
+            if (insight.commonSecurityRisks) context += `Common Security Risks: ${insight.commonSecurityRisks.join(', ')}\n`;
+            context += "---\n";
+        }
+    }
+
+    // 3. Known Bug Patterns from BugPatternAnalysisAgent
+    if (this.sharedAgentContext.knownBugPatterns.length > 0) {
+        const relevantPatterns = (this.sharedAgentContext.knownBugPatterns.filter(p => {
+            if (typeof p === 'string') return p.toLowerCase().includes(topic.toLowerCase());
+            return p.name.toLowerCase().includes(topic.toLowerCase()) ||
+                   p.description.toLowerCase().includes(topic.toLowerCase()) ||
+                   (p.tags || []).some(tag => tag.toLowerCase().includes(topic.toLowerCase()));
+        }) as BugPattern[]).filter(p => p.confidence === 'High' || p.severity === 'Critical' || p.severity === 'High') // Filter by impact
+        .slice(0, MAX_ITEMS);
+
+        if (relevantPatterns.length > 0) {
+            context += "\n--- Relevant Known Bug Patterns (High Impact) ---\n";
+            relevantPatterns.forEach(p => {
+                context += `Pattern: ${p.name} (Severity: ${p.severity || 'N/A'}, Confidence: ${p.confidence || 'N/A'})\nDescription: ${p.description.substring(0,150)}...\n`;
+                context += "---\n";
+            });
+        }
+    }
+    return context;
+  }
+
+  // Helper to get module path for a file path (simplified)
+  private getParentModulePathForContext(filePath: string): string {
+      const parts = filePath.split('/');
+      if (parts.length > 1) parts.pop(); // remove filename
+      return parts.join('/');
+  }
+
 }
