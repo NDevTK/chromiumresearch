@@ -148,10 +148,6 @@ export class CodebaseUnderstandingAgent implements SpecializedAgent {
       const targetModulePath = modulePath;
       let primaryOwners: string[] = [];
       try {
-        const ownersResults = await this.chromiumApi.searchCode({ query: `file:${targetModulePath}/OWNERS`, limit: 1 });
-        if (ownersResults.length > 0 && ownersResults[0].file) {
-          // HACK: Reinstate direct fetch for raw OWNERS content as getFile no longer has `raw` param
-          // and default getFile output is line-numbered if no range is specified.
           const rawOwnersContentResponse = await fetch(`https://chromium.googlesource.com/chromium/src/+/main/${ownersResults[0].file}?format=TEXT`);
           if (rawOwnersContentResponse.ok) {
             const base64Content = await rawOwnersContentResponse.text();
@@ -160,7 +156,6 @@ export class CodebaseUnderstandingAgent implements SpecializedAgent {
           } else {
             console.warn(`CUA: Failed to fetch raw OWNERS content for ${ownersResults[0].file} via direct fetch.`);
           }
-        }
       } catch (e) { console.error(`CUA: Error fetching or parsing OWNERS for ${targetModulePath}:`, e); }
 
       let mojoInterfaces: SearchResult[] = [];
@@ -192,7 +187,7 @@ export class CodebaseUnderstandingAgent implements SpecializedAgent {
 
       let recentCommitsRaw: any = { log: [] };
       try {
-        recentCommitsRaw = await this.chromiumApi.searchCommits({ query: `path:${targetModulePath} (security OR fix OR vuln OR refactor)`, limit: 5 });
+        recentCommitsRaw = await this.chromiumApi.searchCommits({ query: `${targetModulePath}`, limit: 5 });
       } catch (e) { console.error(`CUA: Error searching commits for ${targetModulePath}:`, e); }
 
       const recentCommits: AnalyzedCommitInfo[] = (recentCommitsRaw.log || []).map((commit: any) => ({
@@ -241,7 +236,7 @@ Output a JSON object matching the CodebaseModuleInsight structure, focusing on:
 
         try {
           console.log(`CUA: Identifying symbols for key file: ${keyFile.filePath}`);
-          const fileData = await this.chromiumApi.getFile({ filePath: keyFile.filePath, raw: true });
+          const fileData = await this.chromiumApi.getFile({ filePath: keyFile.filePath});
           if (!fileData || !fileData.content) continue;
 
           // Step 3a: LLM call or Regex to identify 1-2 prominent symbols in this file's content
